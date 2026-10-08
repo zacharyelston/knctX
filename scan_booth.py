@@ -27,8 +27,8 @@ FONT = cv2.FONT_HERSHEY_DUPLEX
 TURNS_NEEDED = 2.0
 KEY_UP = (65362, 2490368)
 KEY_DOWN = (65364, 2621440)
-KEY_ENTER = (13, 10, 65293, 65421)
-KEY_BACK = (8, 65288, 127, 65535)
+KEY_ENTER = (13, 10, 65293, 65421, 16777220, 16777221, 3)  # incl. Qt Key_Return / Key_Enter / keypad
+KEY_BACK = (8, 65288, 127, 65535, 16777219)
 KEY_F11 = (65480,)
 
 
@@ -228,6 +228,8 @@ class Booth:
 
     # ------------------------------------------------------------------ frame
     def tick(self, key):
+        if key != -1:
+            print(f"key {key} (state {self.state})", flush=True)
         handler = getattr(self, f"_tick_{self.state.lower()}")
         canvas = handler(key)
         if time.time() < self.msg_until:
@@ -248,7 +250,7 @@ class Booth:
                 self._start_countdown()
             else:
                 self.force_until = time.time() + 6
-                self.toast(f"Not ready: {self.probe['text']}.  Press ENTER again to scan anyway", 6)
+                self.toast("Not ready - press ENTER again to scan anyway", 6)
         elif key in KEY_BACK:
             self.name = self.name[:-1]
         elif 32 <= key < 127 and len(self.name) < 24:
@@ -264,7 +266,11 @@ class Booth:
         text_c(c, "What's your name?", 235, 0.9, (220, 220, 220))
         cursor = "_" if int(time.time() * 2) % 2 == 0 else " "
         text_c(c, self.name + cursor, 300, 1.5, (255, 255, 255), 2)
-        text_c(c, "Press ENTER to start", 372, 0.8, (180, 255, 180))
+        if time.time() < self.force_until:
+            panel(c, 120, 340, CW - 120, 410, 0.8)
+            text_c(c, "Not ready - press ENTER again to scan anyway", 385, 0.85, (80, 180, 255))
+        else:
+            text_c(c, "Press ENTER to start", 372, 0.8, (180, 255, 180))
         col = (120, 230, 120) if self.probe["ok"] else (80, 180, 255)
         panel(c, 120, CH - 262, CW - 120, CH - 24)
         text_c(c, ("OK  " if self.probe["ok"] else "..  ") + self.probe["text"], CH - 224, 0.75, col)
