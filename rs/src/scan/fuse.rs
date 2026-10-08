@@ -33,7 +33,11 @@ pub struct FuseCfg {
     pub height: f32,
 }
 
-pub fn fuse(frames: &[FrameRef], poses: &[Pose], world: &World, center: [f32; 2], cfg: FuseCfg, progress: &dyn Fn(usize, usize)) -> Volume {
+pub fn fuse(frames: &[FrameRef], poses: &[Pose], world: &World, center: [f32; 2], cfg: FuseCfg, progress: &dyn Fn(usize, usize)) -> Volume { fuse_ex(frames, poses, None, world, center, cfg, progress) }
+
+/// `corr[k] = (R, t)`: extra rigid correction of frame k's points in model space (model position
+/// = R * (pose * p) + t); used for the head, which can move relative to the body.
+pub fn fuse_ex(frames: &[FrameRef], poses: &[Pose], corr: Option<&[(M3, V3)]>, world: &World, center: [f32; 2], cfg: FuseCfg, progress: &dyn Fn(usize, usize)) -> Volume {
     let FuseCfg { voxel, trunc, radius, y0: ybase, height } = cfg;
     let n_of = |len: f32| (len / voxel).ceil() as usize;
     let dims = [n_of(2.0 * radius), n_of(height), n_of(2.0 * radius)];
@@ -47,6 +51,7 @@ pub fn fuse(frames: &[FrameRef], poses: &[Pose], world: &World, center: [f32; 2]
         let (tx, tz) = (tx as f32, tz as f32);
         let (ny, nz) = (dims[1], dims[2]);
         let view_w = view_weights(f.depth);
+        let cr = corr.map(|c| c[k]);
         vol.tsdf
             .par_chunks_mut(slab)
             .zip(vol.wt.par_chunks_mut(slab))
@@ -59,6 +64,13 @@ pub fn fuse(frames: &[FrameRef], poses: &[Pose], world: &World, center: [f32; 2]
                     let vy = origin[1] + j as f32 * voxel;
                     for kk in 0..nz {
                         let vz = origin[2] + kk as f32 * voxel;
+                        let (vx, vy, vz) = match &cr {
+                            Some((r, t)) => {
+                                let m = mat_t_vec(r, sub([vx, vy, vz], *t));
+                                (m[0], m[1], m[2])
+                            }
+                            None => (vx, vy, vz),
+                        };
                         let (dx, dz) = (vx - tx, vz - tz);
                         let pw = [c * dx + s * dz, vy, -s * dx + c * dz]; // model -> frame-k world
                         let pc = world.to_camera(pw);
@@ -161,14 +173,7 @@ fn closed_mask(depth: &[u16], gap: usize) -> Vec<bool> {
 pub fn hull_fill(vol: &mut Volume, frames: &[FrameRef], poses: &[Pose], world: &World, center: [f32; 2], head_h: f32, reach: f32, min_frac: f32) -> usize {
     let [nx, ny, nz] = vol.dims;
     let slab = ny * nz;
-    // top of the fused solid
-    let mut top = 0;
-    for j in 0..ny {
-        let n = (0..nx).map(|i| (0..nz).filter(|k| vol.tsdf[i * slab + j * nz + k] < 0.0 && vol.wt[i * slab + j * nz + k] >= 2.0).count()).sum::<usize>();
-        if n >= 60 {
-            top = j;
-        }
-    }
+    let Some((top, cx, cz, nxl, nzl)) = head_frame(vol) else { return 0 };
     let j0 = top.saturating_sub((head_h / vol.voxel) as usize);
     let masks: Vec<Vec<bool>> = frames.iter().map(|f| closed_mask(f.depth, 30)).collect();
     let (origin, voxel) = (vol.origin, vol.voxel);
@@ -202,6 +207,7 @@ pub fn hull_fill(vol: &mut Volume, frames: &[FrameRef], poses: &[Pose], world: &
         })
         .collect();
     let mut solid: Vec<bool> = (0..nx * ny * nz).map(|id| vol.tsdf[id] < 0.0 && vol.wt[id] >= 2.0).collect();
+    let before = solid.clone();
     let mut added = 0;
     for _ in 0..(reach / voxel).ceil() as usize {
         let mut grow = Vec::new();
@@ -212,7 +218,13 @@ pub fn hull_fill(vol: &mut Volume, frames: &[FrameRef], poses: &[Pose], world: &
                     if solid[id] || !inside[id] {
                         continue;
                     }
-                    if solid[id - slab] || solid[id + slab] || solid[id - nz] || solid[id + nz] || solid[id - 1] || solid[id + 1] {
+                    // grow sideways only: from a neighbour nearer the midline (never forward over the
+                    // face or back, where the surface is already measured well)
+                    let d = (i as f64 - cx) * nxl + (k as f64 - cz) * nzl;
+                    let sgn = if d >= 0.0 { 1.0 } else { -1.0 };
+                    let from_x = (nxl * sgn > 0.3 && solid[id - slab]) || (nxl * sgn < -0.3 && solid[id + slab]);
+                    let from_z = (nzl * sgn > 0.3 && solid[id - nz]) || (nzl * sgn < -0.3 && solid[id + nz]);
+                    if from_x || from_z {
                         grow.push(id);
                     }
                 }
@@ -226,6 +238,133 @@ pub fn hull_fill(vol: &mut Volume, frames: &[FrameRef], poses: &[Pose], world: &
         }
     }
     let _ = center;
+    if std::env::var("KINECT_NO_CONVEX").is_err() {
+        added += convex_layers(vol, &inside, top, cx, cz, nxl, nzl);
+    }
+    // sparse stragglers above the top of the skull (hair strands, dead-band noise)
+    for i in 0..nx {
+        for j in top + 1..ny {
+            for k in 0..nz {
+                let id = i * slab + j * nz + k;
+                vol.tsdf[id] = 1.0;
+                vol.wt[id] = 0.0;
+            }
+        }
+    }
+    if std::env::var("KINECT_NO_BLUR").is_err() {
+        let changed: Vec<bool> = (0..nx * ny * nz).map(|id| !before[id] && vol.tsdf[id] < 0.0 && vol.wt[id] >= 2.0).collect();
+        smooth_added(vol, &changed, 4);
+    }
+    added
+}
+
+/// Blur the TSDF around voxels added by the hull fill so its stair-stepped edge becomes a smooth
+/// surface. Measured surfaces away from the additions are left untouched.
+fn smooth_added(vol: &mut Volume, changed: &[bool], iters: usize) {
+    let [nx, ny, nz] = vol.dims;
+    let slab = ny * nz;
+    // region = added voxels dilated by a few voxels
+    let mut region = changed.to_vec();
+    for _ in 0..3 {
+        let prev = region.clone();
+        for i in 1..nx - 1 {
+            for j in 1..ny - 1 {
+                for k in 1..nz - 1 {
+                    let id = i * slab + j * nz + k;
+                    if !prev[id] && (prev[id - slab] || prev[id + slab] || prev[id - nz] || prev[id + nz] || prev[id - 1] || prev[id + 1]) {
+                        region[id] = true;
+                    }
+                }
+            }
+        }
+    }
+    for _ in 0..iters {
+        let src = vol.tsdf.clone();
+        for i in 1..nx - 1 {
+            for j in 1..ny - 1 {
+                for k in 1..nz - 1 {
+                    let id = i * slab + j * nz + k;
+                    if !region[id] {
+                        continue;
+                    }
+                    let mut acc = 0.0;
+                    for di in [-1i64, 0, 1] {
+                        for dj in [-1i64, 0, 1] {
+                            for dk in [-1i64, 0, 1] {
+                                acc += src[(id as i64 + di * slab as i64 + dj * nz as i64 + dk) as usize];
+                            }
+                        }
+                    }
+                    vol.tsdf[id] = acc / 27.0;
+                    if vol.wt[id] < 2.0 && vol.tsdf[id] < 0.5 {
+                        vol.wt[id] = 2.0;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Horizontal cross-sections of a head are nearly convex. Fill each layer's gaps up to the convex
+/// hull of its solid voxels (inside the silhouette hull only, and away from the face/back midline so
+/// the nose and chin keep their detail). This smooths the steps where hair depth was lost.
+fn convex_layers(vol: &mut Volume, inside: &[bool], top: usize, cx: f64, cz: f64, nxl: f64, nzl: f64) -> usize {
+    let [nx, ny, nz] = vol.dims;
+    let slab = ny * nz;
+    let vox = vol.voxel as f64;
+    let rmax = 0.12 / vox;
+    let lat_min = 0.03 / vox;
+    let (ja, jb) = (top.saturating_sub((0.22 / vox) as usize), top.saturating_sub((0.04 / vox) as usize));
+    let mut added = 0;
+    for j in ja..=jb {
+        let mut pts: Vec<(f64, f64)> = Vec::new();
+        for i in 0..nx {
+            for k in 0..nz {
+                let id = i * slab + j * nz + k;
+                if vol.tsdf[id] < 0.0 && vol.wt[id] >= 2.0 {
+                    let (a, b) = (i as f64 - cx, k as f64 - cz);
+                    if a * a + b * b < rmax * rmax {
+                        pts.push((a, b));
+                    }
+                }
+            }
+        }
+        if pts.len() < 40 {
+            continue;
+        }
+        pts.sort_by(|p, q| p.partial_cmp(q).unwrap());
+        let cross = |o: (f64, f64), a: (f64, f64), b: (f64, f64)| (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0);
+        let mut hull: Vec<(f64, f64)> = Vec::new();
+        for pass in 0..2 {
+            let start = hull.len();
+            let it: Box<dyn Iterator<Item = &(f64, f64)>> = if pass == 0 { Box::new(pts.iter()) } else { Box::new(pts.iter().rev()) };
+            for &p in it {
+                while hull.len() >= start + 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0 {
+                    hull.pop();
+                }
+                hull.push(p);
+            }
+            hull.pop();
+        }
+        for i in 0..nx {
+            for k in 0..nz {
+                let id = i * slab + j * nz + k;
+                if vol.tsdf[id] < 0.0 && vol.wt[id] >= 2.0 || !inside[id] {
+                    continue;
+                }
+                let (a, b) = (i as f64 - cx, k as f64 - cz);
+                if (a * nxl + b * nzl).abs() < lat_min {
+                    continue;
+                }
+                let p = (a, b);
+                if (0..hull.len()).all(|e| cross(hull[e], hull[(e + 1) % hull.len()], p) >= 0.0) {
+                    vol.tsdf[id] = -0.3;
+                    vol.wt[id] = vol.wt[id].max(2.5);
+                    added += 1;
+                }
+            }
+        }
+    }
     added
 }
 
@@ -302,4 +441,124 @@ pub fn symmetrize_head(vol: &mut Volume, head_h: f32) -> usize {
         vol.wt[id] = vol.wt[id].max(2.5);
     }
     n_add
+}
+
+/// Re-colour a mesh from the best-facing frames only: each vertex takes the cos-weighted average of
+/// the `keep` fraction of frames that see it most head-on (averaging every frame blurs the texture
+/// when poses are a few mm off). `tol` is how far (m) the vertex may sit from the observed depth.
+pub fn texture_best_views(mesh: &mut super::mesh::Mesh, frames: &[FrameRef], poses: &[Pose], world: &World, keep: f32, tol: f32) -> usize {
+    let mut normals = super::mesh::vertex_normals(&mesh.verts, &mesh.faces);
+    let n = mesh.verts.len().max(1) as f32;
+    let cen = scale(mesh.verts.iter().fold([0.0; 3], |a, v| add(a, *v)), 1.0 / n);
+    let out: f32 = mesh.verts.iter().zip(&normals).map(|(v, nm)| dot(sub(*v, cen), *nm)).sum();
+    if out < 0.0 {
+        for nm in normals.iter_mut() {
+            *nm = scale(*nm, -1.0);
+        }
+    }
+    let cams: Vec<(f32, f32)> = poses.iter().map(|p| (p[0].cos() as f32, p[0].sin() as f32)).collect();
+    let verts = &mesh.verts;
+    let cols: Vec<Option<[u8; 3]>> = (0..verts.len())
+        .into_par_iter()
+        .map(|vi| {
+            let (v, nm) = (verts[vi], normals[vi]);
+            let mut obs: Vec<(f32, [f32; 3])> = Vec::new();
+            for (k, f) in frames.iter().enumerate() {
+                let (c, s) = cams[k];
+                let (dx, dz) = (v[0] - poses[k][1] as f32, v[2] - poses[k][2] as f32);
+                let pw = [c * dx + s * dz, v[1], -s * dx + c * dz];
+                let pc = world.to_camera(pw);
+                if pc[2] <= 0.3 {
+                    continue;
+                }
+                let u = (FX * pc[0] / pc[2] + CX).round();
+                let vv = (FY * pc[1] / pc[2] + CY).round();
+                if u < 0.0 || vv < 0.0 || u >= W as f32 || vv >= H as f32 {
+                    continue;
+                }
+                let px = vv as usize * W + u as usize;
+                let d = f.depth[px] as f32 / 1000.0;
+                if d <= 0.0 || (d - pc[2]).abs() > tol || !f.col_ok[px] {
+                    continue;
+                }
+                // normal and direction to the camera, both in frame-k world
+                let nw = [c * nm[0] + s * nm[2], nm[1], -s * nm[0] + c * nm[2]];
+                let to_cam = normalize(sub(world.t, pw));
+                let cosv = dot(nw, to_cam);
+                if cosv < 0.15 {
+                    continue;
+                }
+                obs.push((cosv, [f.rgb[px * 3] as f32, f.rgb[px * 3 + 1] as f32, f.rgb[px * 3 + 2] as f32]));
+            }
+            if obs.len() < 3 {
+                return None;
+            }
+            obs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            let take = ((obs.len() as f32 * keep).ceil() as usize).max(3).min(obs.len());
+            let (mut acc, mut ws) = ([0.0f32; 3], 0.0f32);
+            for (w, c) in &obs[..take] {
+                for ch in 0..3 {
+                    acc[ch] += c[ch] * w;
+                }
+                ws += w;
+            }
+            Some([(acc[0] / ws) as u8, (acc[1] / ws) as u8, (acc[2] / ws) as u8])
+        })
+        .collect();
+    let mut n_set = 0;
+    for (i, c) in cols.into_iter().enumerate() {
+        if let Some(c) = c {
+            mesh.rgb[i] = c;
+            n_set += 1;
+        }
+    }
+    n_set
+}
+
+/// Head axes from the fused solid: top voxel row, centre (voxel units) and the unit left-right
+/// direction (the short axis of the skull-band footprint).
+pub fn head_frame(vol: &Volume) -> Option<(usize, f64, f64, f64, f64)> {
+    let [nx, ny, nz] = vol.dims;
+    let slab = ny * nz;
+    let solid = |id: usize| vol.tsdf[id] < 0.0 && vol.wt[id] >= 2.0;
+    let mut top = 0;
+    for j in 0..ny {
+        let n = (0..nx).map(|i| (0..nz).filter(|k| solid(i * slab + j * nz + k)).count()).sum::<usize>();
+        if n >= 60 {
+            top = j;
+        }
+    }
+    let vox = vol.voxel;
+    let (jb0, jb1) = (top.saturating_sub((0.17 / vox) as usize), top.saturating_sub((0.05 / vox) as usize));
+    let (mut n, mut sx, mut sz) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 0..nx {
+        for j in jb0..=jb1 {
+            for k in 0..nz {
+                if solid(i * slab + j * nz + k) {
+                    n += 1.0;
+                    sx += i as f64;
+                    sz += k as f64;
+                }
+            }
+        }
+    }
+    if n < 200.0 {
+        return None;
+    }
+    let (cx, cz) = (sx / n, sz / n);
+    let (mut sxx, mut szz, mut sxz) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 0..nx {
+        for j in jb0..=jb1 {
+            for k in 0..nz {
+                if solid(i * slab + j * nz + k) {
+                    let (a, b) = (i as f64 - cx, k as f64 - cz);
+                    sxx += a * a;
+                    szz += b * b;
+                    sxz += a * b;
+                }
+            }
+        }
+    }
+    let ang = 0.5 * (2.0 * sxz).atan2(sxx - szz);
+    Some((top, cx, cz, -ang.sin(), ang.cos()))
 }

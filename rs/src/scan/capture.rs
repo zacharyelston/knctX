@@ -1,5 +1,6 @@
 //! Capture (tracked, masked frames), raw saving, rescan from raw, and the full model build.
-use super::fuse::{fuse, hull_fill, symmetrize_head, FrameRef, FuseCfg};
+use super::fuse::{fuse, fuse_ex, hull_fill, symmetrize_head, texture_best_views, FrameRef, FuseCfg};
+use super::headalign::align_chunks;
 use super::mesh::{extract_mesh, Mesh};
 use super::rig::Figure;
 use super::segment::Segmenter;
@@ -205,8 +206,57 @@ pub fn build_model(caps: &[Cap], world: &World, center: [f32; 2], prof: &Profile
     let cfg = FuseCfg { voxel: prof.voxel, trunc: envf("KINECT_TRUNC", prof.trunc), radius: prof.radius, y0: y_range.0, height: y_range.1 - y_range.0 };
     let vol = fuse(&frames, &up, world, center, cfg, &|k, n| progress("Fusing depth", 0.1 + 0.7 * k as f32 / n as f32));
     let mut vol = vol;
+    let chunk_deg = envf("KINECT_CHUNK_DEG", 0.0) as f64;
+    if prof.name == "bust" && chunk_deg > 0.0 && std::env::var("KINECT_NO_HEADALIGN").is_err() {
+        // head points of every frame in model space, grouped by body yaw
+        let hcut = y_range.1 - 0.34;
+        let chunk_of: Vec<usize> = poses.iter().map(|p| (p[0].abs().to_degrees() / chunk_deg) as usize).collect();
+        let nc = chunk_of.iter().copied().max().unwrap_or(0) + 1;
+        let mut cp: Vec<Vec<V3>> = vec![Vec::new(); nc];
+        for (k, c) in chunk_of.iter().enumerate() {
+            cp[*c].extend(pts[k].iter().step_by(4).filter(|q| q[1] > hcut).map(|q| pose_apply_pt(&poses[k], *q)));
+        }
+        let corr_c = align_chunks(&cp, 0.03, envf("KINECT_HEAD_PASSES", 5.0) as usize, log);
+        let corr: Vec<_> = use_idx.iter().map(|&i| corr_c[chunk_of[i]]).collect();
+        let m = ((y_range.1 - 0.36 - y_range.0) / prof.voxel).ceil().max(0.0) as usize;
+        let y0h = y_range.0 + m as f32 * prof.voxel;
+        let hcfg = FuseCfg { y0: y0h, height: y_range.1 - y0h, ..cfg };
+        let hv = fuse_ex(&frames, &up, Some(&corr), world, center, hcfg, &|_, _| {});
+        // blend into the body volume over the neck
+        let [_, ny, nz] = vol.dims;
+        let slab = ny * nz;
+        let hny = hv.dims[1];
+        let (b0, b1) = (m as f32 + 2.0, m as f32 + 0.06 / prof.voxel);
+        for i in 0..vol.dims[0] {
+            for jj in 0..hny.min(ny.saturating_sub(m)) {
+                let j = jj + m;
+                let w = ((j as f32 - b0) / (b1 - b0)).clamp(0.0, 1.0);
+                if w <= 0.0 {
+                    continue;
+                }
+                for k in 0..nz {
+                    let (id, hid) = (i * slab + j * nz + k, i * hv.dims[1] * nz + jj * nz + k);
+                    if hv.wt[hid] <= 0.0 {
+                        continue;
+                    }
+                    if vol.wt[id] <= 0.0 {
+                        vol.tsdf[id] = hv.tsdf[hid];
+                        vol.wt[id] = hv.wt[hid];
+                    } else {
+                        vol.tsdf[id] = (1.0 - w) * vol.tsdf[id] + w * hv.tsdf[hid];
+                        vol.wt[id] = (1.0 - w) * vol.wt[id] + w * hv.wt[hid];
+                    }
+                    if w > 0.5 && hv.cwt[hid] > 0.0 {
+                        vol.col[id] = hv.col[hid];
+                        vol.cwt[id] = hv.cwt[hid];
+                    }
+                }
+            }
+        }
+        log(format!("head chunks: {nc}"));
+    }
     if prof.name == "bust" && std::env::var("KINECT_NO_HULL").is_err() {
-        let n = hull_fill(&mut vol, &frames, &up, world, center, envf("KINECT_HULL_H", 0.6), envf("KINECT_HULL_REACH", 0.04), envf("KINECT_HULL_FRAC", 0.97));
+        let n = hull_fill(&mut vol, &frames, &up, world, center, envf("KINECT_HULL_H", 0.30), envf("KINECT_HULL_REACH", 0.04), envf("KINECT_HULL_FRAC", 0.97));
         log(format!("hull fill: +{n} voxels"));
         if std::env::var("KINECT_NO_SYM").is_err() {
             let m = symmetrize_head(&mut vol, 0.26);
@@ -214,7 +264,15 @@ pub fn build_model(caps: &[Cap], world: &World, center: [f32; 2], prof: &Profile
         }
     }
     progress("Building mesh", 0.85);
-    extract_mesh(&vol, envf("KINECT_MINOBS", 2.0), envf("KINECT_SMOOTH", prof.smooth as f32) as _, prof.min_extent)
+    let mut mesh = extract_mesh(&vol, envf("KINECT_MINOBS", 2.0), envf("KINECT_SMOOTH", prof.smooth as f32) as _, prof.min_extent)?;
+    if prof.name == "bust" && std::env::var("KINECT_NO_BESTTEX").is_err() {
+        let n = texture_best_views(&mut mesh, &frames, &up, world, envf("KINECT_TEX_KEEP", 0.15), envf("KINECT_TEX_TOL", 0.04));
+        log(format!("best-view texture: {n}/{} vertices", mesh.verts.len()));
+    }
+    if std::env::var("KINECT_GREY").is_ok() {
+        mesh.rgb.iter_mut().for_each(|c| *c = [190, 190, 190]);
+    }
+    Ok(mesh)
 }
 
 pub struct RescanStats {
