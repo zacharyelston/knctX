@@ -32,7 +32,7 @@ KEY_F11 = (65480,)
 
 def text(img, s, org, scale=0.8, color=(255, 255, 255), thick=1, shadow=True):
     if shadow:
-        cv2.putText(img, s, (org[0] + 1, org[1] + 1), FONT, scale, (0, 0, 0), thick + 1, cv2.LINE_AA)
+        cv2.putText(img, s, (org[0] + 2, org[1] + 2), FONT, scale, (0, 0, 0), thick, cv2.LINE_AA)
     cv2.putText(img, s, org, FONT, scale, color, thick, cv2.LINE_AA)
 
 
@@ -98,28 +98,53 @@ class Booth:
         """Live feedback while the visitor is typing their name / getting into place."""
         now = time.time()
         rgb, depth = self.src.frames()
-        if depth is None or now - self.probe["t"] < 0.6:
+        if depth is None or now - self.probe["t"] < 0.5:
             return
         self.probe["t"] = now
-        if not self.world.floor_found and now - self.probe.get("floor_t", 0) > 2.0:
+        dist = bs.nearest_distance(depth)
+        self.probe["dist"] = dist
+        # keep re-fitting the floor (a person at the keyboard gives a bad fit at first)
+        if now - self.probe.get("floor_t", 0) > 2.0:
             self.probe["floor_t"] = now
             w = bs.fit_floor(depth)
             if w is not None:
                 self.world = w
+            elif dist is not None and dist < 1.8:
+                self.world = bs.World()  # too close to see the floor: forget any stale fit
         seg = bs.Segmenter(self.world)
         res = seg.find_person(depth)
-        if res is None:
-            self.probe.update(text="Step into view (about 3 m from the sensor)", ok=False)
-            return
-        m, _ = seg.mask(depth)
-        cropped_bottom, cropped_top = m[-4:].any(), m[:4].any()
-        dist = float(np.median(depth[m])) / 1000 if m.any() else 0
-        if cropped_bottom or cropped_top:
-            self.probe.update(text="Step back - your whole body must be in view", ok=False)
-        elif not self.world.floor_found:
-            self.probe.update(text="Can't see the floor - tilt the sensor down a little", ok=False)
+        if dist is None:
+            self.probe.update(text="Nothing in view - step in front of the sensor", ok=False)
+        elif dist < 2.4:
+            self.probe.update(text=f"{dist:.1f} m - too close, step back to about 3 m", ok=False)
+        elif dist > 4.0:
+            self.probe.update(text=f"{dist:.1f} m - too far, come closer (about 3 m)", ok=False)
+        elif res is None:
+            self.probe.update(text=f"{dist:.1f} m - good distance, but I can't see a full person yet", ok=False)
         else:
-            self.probe.update(text=f"Perfect - {res[1]:.2f} m tall, {dist:.1f} m away", ok=True)
+            m, _ = seg.mask(depth)
+            if m[-4:].any() or m[:4].any():
+                self.probe.update(text=f"{dist:.1f} m - your head or feet are cut off, adjust tilt or step back", ok=False)
+            elif not self.world.floor_found:
+                self.probe.update(text=f"{dist:.1f} m - can't see the floor, tilt the sensor down a little", ok=False)
+            else:
+                self.probe.update(text=f"Perfect - {res[1]:.2f} m tall, {dist:.1f} m away", ok=True)
+
+    def _distance_meter(self, c, y):
+        """Horizontal 1-5 m scale with the ideal zone in green and a marker at the current distance."""
+        x0, x1 = 170, CW - 170
+        px = lambda m: int(x0 + (x1 - x0) * (np.clip(m, 1.0, 5.0) - 1.0) / 4.0)  # noqa: E731
+        cv2.rectangle(c, (x0, y), (x1, y + 10), (70, 70, 70), -1)
+        cv2.rectangle(c, (px(2.6), y), (px(3.6), y + 10), (90, 200, 90), -1)
+        for m in (1, 2, 3, 4, 5):
+            cv2.line(c, (px(m), y + 10), (px(m), y + 16), (200, 200, 200), 1)
+            text(c, f"{m}m", (px(m) - 12, y + 34), 0.45, (190, 190, 190), 1, False)
+        d = self.probe.get("dist")
+        if d is not None:
+            ok = 2.6 <= d <= 3.6
+            col = (120, 230, 120) if ok else (80, 180, 255)
+            cv2.fillPoly(c, [np.array([[px(d), y - 2], [px(d) - 9, y - 16], [px(d) + 9, y - 16]])], col)
+            text(c, f"{d:.1f} m", (px(d) - 26, y - 22), 0.6, col, 1)
 
     # ------------------------------------------------------------------ states
     def _start_countdown(self):
@@ -227,11 +252,12 @@ class Booth:
         text_c(c, self.name + cursor, 300, 1.5, (255, 255, 255), 2)
         text_c(c, "Press ENTER to start", 372, 0.8, (180, 255, 180))
         col = (120, 230, 120) if self.probe["ok"] else (80, 180, 255)
-        panel(c, 120, CH - 190, CW - 120, CH - 30)
-        text_c(c, ("OK  " if self.probe["ok"] else "..  ") + self.probe["text"], CH - 140, 0.8, col)
-        text_c(c, "Stand ~3 m back, arms slightly away from your body (A-pose)", CH - 100, 0.6, (210, 210, 210), 1, False)
-        text_c(c, "After 3-2-1, turn slowly on the spot - TWO full turns (about 10 s each)", CH - 72, 0.6, (210, 210, 210), 1, False)
-        text_c(c, f"Up/Down arrows tilt the sensor ({self.src.tilt_target} deg)   Esc quits", CH - 44, 0.5, (150, 150, 150), 1, False)
+        panel(c, 120, CH - 262, CW - 120, CH - 24)
+        text_c(c, ("OK  " if self.probe["ok"] else "..  ") + self.probe["text"], CH - 224, 0.75, col)
+        self._distance_meter(c, CH - 168)
+        text_c(c, "Stand ~3 m back, arms slightly away from your body (A-pose)", CH - 106, 0.6, (210, 210, 210), 1, False)
+        text_c(c, "After 3-2-1, turn slowly on the spot - TWO full turns (about 10 s each)", CH - 80, 0.6, (210, 210, 210), 1, False)
+        text_c(c, f"Up/Down arrows tilt the sensor ({self.src.tilt_target} deg)   Esc quits", CH - 50, 0.5, (150, 150, 150), 1, False)
         return c
 
     def _tick_countdown(self, key):

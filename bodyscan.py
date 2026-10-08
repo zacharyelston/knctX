@@ -53,7 +53,7 @@ class World:
 def fit_floor(depth_mm, seed=0):
     """RANSAC the dominant roughly-horizontal plane below the camera. Returns World or None."""
     pts = cam_points(depth_mm)[::4, ::4].reshape(-1, 3)
-    pts = pts[(pts[:, 2] > 0.5) & (pts[:, 2] < 5)]
+    pts = pts[(pts[:, 2] > 1.0) & (pts[:, 2] < 5)]
     if len(pts) < 2000:
         return None
     rng = np.random.default_rng(seed)
@@ -68,10 +68,10 @@ def fit_floor(depth_mm, seed=0):
         n = n / nn
         if n @ up < 0:
             n = -n
-        if n @ up < 0.8:  # must be roughly horizontal
+        if n @ up < 0.85:  # must be roughly horizontal
             continue
         c = float(n @ s[0])
-        if c > -0.2:  # floor must be at least 20 cm below the camera
+        if not -2.5 < c < -0.4:  # camera plausibly 0.4-2.5 m above the floor
             continue
         inl = np.abs(pts @ n - c) < 0.03
         cnt = int(inl.sum())
@@ -85,6 +85,8 @@ def fit_floor(depth_mm, seed=0):
     if n @ up < 0:
         n = -n
     c = float(n @ mean)
+    if not -2.5 < c < -0.4:
+        return None
     ex = np.array([1, 0, 0], np.float32)
     xw = ex - (ex @ n) * n
     xw /= np.linalg.norm(xw)
@@ -93,6 +95,17 @@ def fit_floor(depth_mm, seed=0):
 
 
 # --------------------------------------------------------------------------- segmentation
+
+def nearest_distance(depth):
+    """Distance (m) to the nearest sizeable object in the middle of the view, or None."""
+    d = depth[:, 120:520]
+    v = d[d > 500]
+    if v.size < 4000:
+        return None
+    z0 = np.percentile(v, 8)
+    blob = d[(d > 0) & (np.abs(d.astype(np.int32) - z0) < 250)]
+    return float(np.median(blob)) / 1000 if blob.size > 3000 else None
+
 
 class Segmenter:
     """Finds the nearest person-sized object and masks it (floor and background removed)."""
