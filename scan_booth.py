@@ -117,6 +117,10 @@ class Booth:
                 self.world = bs.World()  # too close to see the floor: forget any stale fit
         seg = bs.Segmenter(self.world)
         res = seg.find_person(depth)
+        if res is not None:
+            self.probe["last_res"], self.probe["last_res_t"] = res, now
+        elif now - self.probe.get("last_res_t", 0) < 1.5:
+            res = self.probe["last_res"]  # brief dropouts (e.g. side-on pose) shouldn't flicker the status
         if dist is None:
             self.probe.update(text="Nothing in view - step in front of the sensor", ok=False)
         elif dist < 2.4:
@@ -126,9 +130,14 @@ class Booth:
         elif res is None:
             self.probe.update(text=f"{dist:.1f} m - good distance, but I can't see a full person yet", ok=False)
         else:
-            m, _ = seg.mask(depth)
-            if m[-4:].any() or m[:4].any():
-                self.probe.update(text=f"{dist:.1f} m - your head or feet are cut off, adjust tilt or step back", ok=False)
+            m, pw = seg.mask(depth)
+            ymin = float(np.percentile(pw[m][:, 1], 1)) if m.any() else 9.0
+            if m[-4:].any() or ymin > 0.35:
+                self.probe.update(text=f"{dist:.1f} m - feet cut off: tilt the sensor down (Down arrow) or step back", ok=False)
+            elif m[:4].any():
+                self.probe.update(text=f"{dist:.1f} m - head cut off: tilt the sensor up (Up arrow) or step back", ok=False)
+            elif res[1] < 1.3:
+                self.probe.update(text=f"{dist:.1f} m - I only see {res[1]:.1f} m of you: step back or tilt so your whole body is in view", ok=False)
             elif not self.world.floor_found:
                 self.probe.update(text=f"{dist:.1f} m - can't see the floor, tilt the sensor down a little", ok=False)
             else:
@@ -177,7 +186,7 @@ class Booth:
     def _sample(self):
         rgb, depth = self.src.frames()
         seq = self.src.seq
-        if rgb is None or seq == self.last_seq or time.time() - self.last_t < 0.07:
+        if rgb is None or seq == self.last_seq or time.time() - self.last_t < 0.09:
             return rgb
         self.last_seq, self.last_t = seq, time.time()
         m, used = self.cap.add(rgb, depth)
@@ -310,7 +319,7 @@ class Booth:
             self._finish_raw(dict(result="cancelled"))
             self.state = "NAME"
             self.toast("Scan cancelled")
-        elif (key == 32 and turns >= 1.0) or turns >= TURNS_NEEDED * 0.985 or ncap >= 300 or elapsed > 75:
+        elif (key == 32 and turns >= 1.0) or turns >= TURNS_NEEDED * 0.985 or ncap >= 360 or elapsed > 75:
             if ncap >= 40:
                 self._finish_raw()
                 self._start_process()

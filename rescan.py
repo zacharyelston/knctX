@@ -21,9 +21,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("scan", help="scan folder containing raw/")
     ap.add_argument("--out", help="output folder (default: <scan>/rescan_<time>)")
+    ap.add_argument("--refloor", action="store_true", help="re-detect the floor from the first raw frame")
     args = ap.parse_args()
 
-    out, stats, cap = bs.rescan(args.scan, args.out)
+    out, stats, cap = bs.rescan(args.scan, args.out, refloor=args.refloor)
     verts, faces, rgb = bs.load_ply(out / "model.ply")
     fig = bs.Figure(verts, faces, rgb)
     (out / "meta.json").write_text(json.dumps(dict(stats=stats, **fig.meta()), indent=2))

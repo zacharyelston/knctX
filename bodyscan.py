@@ -51,7 +51,12 @@ class World:
 
 
 def fit_floor(depth_mm, seed=0):
-    """RANSAC the dominant roughly-horizontal plane below the camera. Returns World or None."""
+    """Find the floor: the *lowest* strong horizontal surface. Returns World or None.
+
+    RANSAC finds the dominant roughly-horizontal plane (it may be a table), which fixes the
+    up direction.  All points are then binned by height along that direction and the lowest
+    well-supported level is taken as the floor, so desks and tables above it are ignored.
+    """
     pts = cam_points(depth_mm)[::4, ::4].reshape(-1, 3)
     pts = pts[(pts[:, 2] > 1.0) & (pts[:, 2] < 5)]
     if len(pts) < 2000:
@@ -70,20 +75,42 @@ def fit_floor(depth_mm, seed=0):
             n = -n
         if n @ up < 0.85:  # must be roughly horizontal
             continue
-        c = float(n @ s[0])
-        if not -2.5 < c < -0.4:  # camera plausibly 0.4-2.5 m above the floor
-            continue
-        inl = np.abs(pts @ n - c) < 0.03
+        inl = np.abs(pts @ n - float(n @ s[0])) < 0.03
         cnt = int(inl.sum())
         if best is None or cnt > best[0]:
             best = (cnt, inl)
-    if best is None or best[0] < 0.05 * len(pts):
+    if best is None or best[0] < 0.03 * len(pts):
         return None
     P = pts[best[1]]
     mean = P.mean(0)
     n = np.linalg.svd(P - mean, full_matrices=False)[2][-1]
     if n @ up < 0:
         n = -n
+    # lowest well-supported horizontal level along n (heights are n.p, floor is the most negative)
+    h = pts @ n
+    edges = np.arange(h.min(), h.max() + 0.02, 0.02)
+    hist, _ = np.histogram(h, edges)
+    thr = max(150, 0.012 * len(pts))
+    floor_c = None
+    for i in range(len(hist)):
+        c = 0.5 * (edges[i] + edges[i + 1])
+        if hist[i] >= thr and hist[i] >= hist[max(i - 1, 0)] and hist[i] >= hist[min(i + 1, len(hist) - 1)]:
+            if -2.5 < c < -0.4:
+                floor_c = c
+                break
+    if floor_c is None:
+        return None
+    # refine the plane on that level, allowing a small tilt correction
+    inl = np.abs(h - floor_c) < 0.04
+    if inl.sum() < 300:
+        return None
+    P = pts[inl]
+    mean = P.mean(0)
+    n2 = np.linalg.svd(P - mean, full_matrices=False)[2][-1]
+    if n2 @ up < 0:
+        n2 = -n2
+    if n2 @ n > 0.97:
+        n = n2
     c = float(n @ mean)
     if not -2.5 < c < -0.4:
         return None
@@ -123,13 +150,13 @@ class Segmenter:
         pw = self.world_points(depth)[::2, ::2].reshape(-1, 3)
         zc = depth[::2, ::2].reshape(-1).astype(np.float32) / 1000
         sel = (zc > 1.0) & (zc < 4.5) & (pw[:, 1] > 0.25) & (pw[:, 1] < 2.1)
-        if sel.sum() < 3000:
+        if sel.sum() < 1200:
             return None
         pw, zc = pw[sel], zc[sel]
         # nearest 10 cm window of camera-distance holding enough points
         for lo in np.arange(1.0, 4.4, 0.05):
             win = (zc >= lo) & (zc < lo + 0.15)
-            if win.sum() >= 1500:
+            if win.sum() >= 450:
                 near = (zc >= lo - 0.05) & (zc < lo + 0.6)
                 c = np.median(pw[near][:, [0, 2]], axis=0)
                 around = (np.abs(pw[:, 0] - c[0]) < 0.6) & (np.abs(pw[:, 2] - c[1]) < 0.6)
@@ -223,13 +250,23 @@ def icp_yaw(src, tgt, tree, init, iters=25, max_d=0.10):
 
 
 class Tracker:
-    """Frame-to-frame yaw tracking of a spinning person (constant-velocity initial guess)."""
+    """Keyframe-based yaw tracking of a spinning person.
+
+    Aligning every frame to the previous one fails at small steps: a few degrees per frame
+    moves the body a centimetre, below the sensor's depth quantisation, and ICP then biases
+    toward "hardly moved".  Instead each frame is aligned to the last *keyframe*, which is only
+    replaced after ~KEY_DEG of rotation, so every alignment sees a motion well above the noise.
+    """
+
+    KEY_DEG = 12.0
 
     def __init__(self):
-        self.prev = None
+        self.key = None            # keyframe points
         self.tree = None
-        self.pose = np.zeros(3)   # model <- current frame
-        self.delta = np.zeros(3)
+        self.key_pose = np.zeros(3)   # model <- keyframe
+        self.pose = np.zeros(3)       # model <- current frame
+        self.vel = 0.0                # yaw rad/frame, smoothed
+        self.last_phi = 0.0
         self.quality = 1.0
 
     @property
@@ -237,15 +274,30 @@ class Tracker:
         return float(self.pose[0])
 
     def add(self, pts):
-        if self.prev is not None:
-            pose, rms, frac = icp_yaw(pts, self.prev, self.tree, self.delta)
-            ok = rms < 0.03 and frac > 0.4
-            self.quality = 0.8 * self.quality + 0.2 * (1.0 if ok else 0.0)
-            self.delta = pose if ok else self.delta  # keep predicting through bad frames
-            self.pose = pose_compose(self.pose, self.delta)
-        self.prev = pts
-        self.tree = cKDTree(pts)
+        if self.key is None:
+            self._set_key(pts, np.zeros(3))
+            return self.pose.copy()
+        c = self.key[:, [0, 2]].mean(0)
+        # constant-velocity guess: rotate about the body centre (not the camera) so the
+        # translation guess is small
+        guess_phi = self.last_phi - self.key_pose[0] + self.vel
+        init = np.array([guess_phi, *(c - rot2(guess_phi) @ c)])
+        rel, rms, frac = icp_yaw(pts, self.key, self.tree, init)
+        ok = rms < 0.04 and frac > 0.35 and abs(rel[0]) < np.radians(60)
+        self.quality = 0.85 * self.quality + 0.15 * (1.0 if ok else 0.0)
+        if not ok:
+            rel = init  # coast on the velocity estimate until tracking recovers
+        self.pose = pose_compose(self.key_pose, rel)
+        self.vel = 0.6 * self.vel + 0.4 * (self.pose[0] - self.last_phi) if ok else self.vel
+        self.last_phi = float(self.pose[0])
+        if ok and abs(rel[0]) > np.radians(self.KEY_DEG):
+            self._set_key(pts, self.pose)
         return self.pose.copy()
+
+    def _set_key(self, pts, pose):
+        self.key, self.tree, self.key_pose = pts, cKDTree(pts), np.array(pose, float)
+        self.pose = np.array(pose, float)
+        self.last_phi = float(pose[0])
 
 
 def close_loops(pts_list, poses, log=None):
@@ -375,7 +427,7 @@ class RawSaver:
         (self.dir / "capture.json").write_text(json.dumps(info))
 
 
-def rescan(folder, out=None, log=print):
+def rescan(folder, out=None, log=print, refloor=False):
     """Rebuild a model from a saved raw capture (`<scan>/raw`). Returns (out_folder, stats)."""
     folder = Path(folder)
     raw = folder / "raw"
@@ -385,8 +437,12 @@ def rescan(folder, out=None, log=print):
                       cv2.imread(str(raw / f"depth_{i:05d}.png"), cv2.IMREAD_UNCHANGED))
     rgb0, d0 = load(0)
     world = World(np.array(cfg["world_R"]), np.array(cfg["world_t"]), cfg["floor_found"])
+    if refloor:
+        w2 = fit_floor(d0)
+        log(f"refit floor: {'camera height %.2f m' % w2.t[1] if w2 else 'FAILED, keeping the saved one'}")
+        world = w2 or world
     seg = Segmenter(world)
-    if cfg.get("center"):
+    if cfg.get("center") and not refloor:
         seg.center = np.array(cfg["center"], np.float32)
     elif seg.find_person(d0) is None:
         raise RuntimeError("no person found in the first raw frame")
