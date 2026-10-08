@@ -184,12 +184,15 @@ pub fn build_model(caps: &[Cap], world: &World, center: [f32; 2], prof: &Profile
         log(format!("closed yaw: {}", l.join(" ")));
     }
     let poses = if prof.refine_passes > 0 { refine_poses(&pts, &poses, prof.loops.max_d, prof.refine_passes, log) } else { poses };
+    if let Ok(path) = std::env::var("KINECT_DUMP_POSES") {
+        let _ = std::fs::write(path, serde_json::to_string(&poses).unwrap_or_default());
+    }
     let head_passes: usize = std::env::var("KINECT_HEAD_REFINE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let poses = if head_passes > 0 && prof.name == "bust" {
         let cut = y_range.1 - 0.32;
         let head: Vec<Vec<V3>> = pts.iter().map(|p| p.iter().copied().filter(|q| q[1] > cut).collect()).collect();
         let hr: Vec<&[V3]> = head.iter().map(|h| h.as_slice()).collect();
-        refine_poses(&hr, &poses, 0.03, head_passes, log)
+        refine_poses(&hr, &poses, std::env::var("KINECT_HEAD_D").ok().and_then(|v| v.parse().ok()).unwrap_or(0.03), head_passes, log)
     } else {
         poses
     };
@@ -198,10 +201,11 @@ pub fn build_model(caps: &[Cap], world: &World, center: [f32; 2], prof: &Profile
     let col_ok: Vec<Vec<bool>> = use_idx.iter().map(|&i| interior(&caps[i].depth, 3)).collect();
     let frames: Vec<FrameRef> = use_idx.iter().zip(&col_ok).map(|(&i, ok)| FrameRef { depth: &caps[i].depth, col_ok: ok, rgb: &caps[i].rgb }).collect();
     let up: Vec<Pose> = use_idx.iter().map(|&i| poses[i]).collect();
-    let cfg = FuseCfg { voxel: prof.voxel, trunc: prof.trunc, radius: prof.radius, y0: y_range.0, height: y_range.1 - y_range.0 };
+    let envf = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let cfg = FuseCfg { voxel: prof.voxel, trunc: envf("KINECT_TRUNC", prof.trunc), radius: prof.radius, y0: y_range.0, height: y_range.1 - y_range.0 };
     let vol = fuse(&frames, &up, world, center, cfg, &|k, n| progress("Fusing depth", 0.1 + 0.7 * k as f32 / n as f32));
     progress("Building mesh", 0.85);
-    extract_mesh(&vol, 2.0, prof.smooth, prof.min_extent)
+    extract_mesh(&vol, envf("KINECT_MINOBS", 2.0), envf("KINECT_SMOOTH", prof.smooth as f32) as _, prof.min_extent)
 }
 
 pub struct RescanStats {

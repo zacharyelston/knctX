@@ -82,7 +82,8 @@ pub fn fuse(frames: &[FrameRef], poses: &[Pose], world: &World, center: [f32; 2]
                         let sv = (sdf / trunc).clamp(-1.0, 1.0);
                         let id = j * nz + kk;
                         let w0 = ws[id];
-                        ts[id] = (ts[id] * w0 + sv) / (w0 + 1.0);
+                        let wd = view_w[px].sqrt().max(0.15);
+                        ts[id] = (ts[id] * w0 + sv * wd) / (w0 + wd);
                         if f.col_ok[px] && sdf.abs() < trunc * 0.6 {
                             let c0 = cw[id];
                             let w = view_w[px];
@@ -91,7 +92,7 @@ pub fn fuse(frames: &[FrameRef], poses: &[Pose], world: &World, center: [f32; 2]
                             }
                             cw[id] = c0 + w;
                         }
-                        ws[id] = w0 + 1.0;
+                        ws[id] = w0 + wd;
                     }
                 }
             });

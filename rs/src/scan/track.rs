@@ -287,6 +287,10 @@ pub fn close_loops(pts_list: &[&[V3]], poses: &[Pose], cfg: LoopCfg, log: &mut d
             log(format!("loop {j}: rejected (rms {rms:.3}, yaw {:+.1})", e[0].to_degrees()));
             continue;
         }
+        if std::env::var("KINECT_NO_LOOP_T").is_ok() {
+            e[1] = 0.0;
+            e[2] = 0.0;
+        }
         log(format!("loop {j}: frame {k}, drift {:+.1} deg, {:.1} cm, rms {:.1} cm", e[0].to_degrees(), shift * 100.0, rms * 100.0));
         anchors.push(k);
         corr.push(e);
@@ -299,7 +303,7 @@ pub fn close_loops(pts_list: &[&[V3]], poses: &[Pose], cfg: LoopCfg, log: &mut d
         } else if i == 0 || anchors[i] == k {
             corr[i]
         } else {
-            let w = (k - anchors[i - 1]) as f64 / (anchors[i] - anchors[i - 1]) as f64;
+            let w = ((k - anchors[i - 1]) as f64 / (anchors[i] - anchors[i - 1]) as f64).powf(std::env::var("KINECT_LOOP_P").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0));
             [0, 1, 2].map(|c| corr[i - 1][c] + w * (corr[i][c] - corr[i - 1][c]))
         };
         out[k] = pose_compose(&e, &poses[k]);
