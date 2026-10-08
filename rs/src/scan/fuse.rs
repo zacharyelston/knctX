@@ -46,6 +46,7 @@ pub fn fuse(frames: &[FrameRef], poses: &[Pose], world: &World, center: [f32; 2]
         let (c, s) = (phi.cos() as f32, phi.sin() as f32);
         let (tx, tz) = (tx as f32, tz as f32);
         let (ny, nz) = (dims[1], dims[2]);
+        let view_w = view_weights(f.depth);
         vol.tsdf
             .par_chunks_mut(slab)
             .zip(vol.wt.par_chunks_mut(slab))
@@ -82,12 +83,13 @@ pub fn fuse(frames: &[FrameRef], poses: &[Pose], world: &World, center: [f32; 2]
                         let id = j * nz + kk;
                         let w0 = ws[id];
                         ts[id] = (ts[id] * w0 + sv) / (w0 + 1.0);
-                        if f.col_ok[px] {
+                        if f.col_ok[px] && sdf.abs() < trunc * 0.6 {
                             let c0 = cw[id];
+                            let w = view_w[px];
                             for ch in 0..3 {
-                                cs[id][ch] = (cs[id][ch] * c0 + f.rgb[px * 3 + ch] as f32) / (c0 + 1.0);
+                                cs[id][ch] = (cs[id][ch] * c0 + f.rgb[px * 3 + ch] as f32 * w) / (c0 + w);
                             }
-                            cw[id] = c0 + 1.0;
+                            cw[id] = c0 + w;
                         }
                         ws[id] = w0 + 1.0;
                     }
@@ -96,4 +98,26 @@ pub fn fuse(frames: &[FrameRef], poses: &[Pose], world: &World, center: [f32; 2]
         progress(k + 1, frames.len());
     }
     vol
+}
+
+/// Colour weight per pixel: face-on surfaces count far more than grazing ones (cos^4 of the view angle).
+fn view_weights(depth: &[u16]) -> Vec<f32> {
+    let mut out = vec![0.0f32; W * H];
+    for y in 1..H - 1 {
+        for x in 1..W - 1 {
+            let d = depth[y * W + x] as f32;
+            if d <= 0.0 {
+                continue;
+            }
+            let g = |a: usize, b: usize| {
+                let (da, db) = (depth[a] as f32, depth[b] as f32);
+                if da > 0.0 && db > 0.0 { (db - da) / 2.0 / (d / FX) } else { 0.0 }
+            };
+            let sx = g(y * W + x - 1, y * W + x + 1);
+            let sy = g((y - 1) * W + x, (y + 1) * W + x);
+            let c2 = 1.0 / (1.0 + sx * sx + sy * sy);
+            out[y * W + x] = c2 * c2 + 0.02;
+        }
+    }
+    out
 }

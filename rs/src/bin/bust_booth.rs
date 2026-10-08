@@ -37,20 +37,20 @@ const GRAY_T: Col = bgr(210, 210, 210);
 /// Distance (m) to the nearest sizeable object in the middle of the view (0.5-2.2 m), or None.
 fn bust_distance(depth: &[u16]) -> Option<f32> {
     let mut v: Vec<f32> = Vec::new();
-    for r in 0..H {
-        for c in 160..480 {
+    for r in 100..420 {
+        for c in 220..420 {
             let d = depth[r * W + c];
             if d > 500 && d < 2200 {
                 v.push(d as f32);
             }
         }
     }
-    if v.len() < 6000 {
+    if v.len() < 5000 {
         return None;
     }
     let z0 = percentile(&mut v.clone(), 8.0);
     let mut blob: Vec<f32> = v.into_iter().filter(|d| (d - z0).abs() < 200.0).collect();
-    if blob.len() > 5000 { Some(median(&mut blob) / 1000.0) } else { None }
+    if blob.len() > 4000 { Some(median(&mut blob) / 1000.0) } else { None }
 }
 
 /// First image row holding the subject (depth within 25 cm of `dist`) and the subject's pixel count.
@@ -207,8 +207,8 @@ impl Booth {
         let auto = if self.autotilt { " (auto-tilting)" } else { "" };
         let (text, ok) = match dist {
             None => ("Nothing in view - sit down in front of the sensor".to_string(), false),
-            Some(d) if d < 0.8 => (format!("{d:.2} m - too close, move back to about 1.1 m"), false),
-            Some(d) if d > 1.35 => (format!("{d:.2} m - too far, move closer (about 1.1 m)"), false),
+            Some(d) if d < 0.8 => (format!("{d:.2} m - too close, move back to about 1.0 m"), false),
+            Some(d) if d > 1.25 => (format!("{d:.2} m - too far, move closer (about 1.0 m)"), false),
             Some(d) if head_cut => (format!("{d:.2} m - head cut off: tilting sensor up{auto}, or sit lower"), false),
             Some(d) if head_low => (format!("{d:.2} m - too much empty space above you: tilting down{auto}"), false),
             Some(d) if res.is_none() || area < 25000 => (format!("{d:.2} m - good distance, but I can't see head and shoulders yet"), false),
@@ -222,13 +222,13 @@ impl Booth {
         let (x0, x1) = (170, CW as i32 - 170);
         let px = |m: f32| (x0 as f32 + (x1 - x0) as f32 * (m.clamp(0.5, 2.0) - 0.5) / 1.5) as i32;
         c.rect(x0, y, x1, y + 10, bgr(70, 70, 70));
-        c.rect(px(0.9), y, px(1.3), y + 10, bgr(90, 200, 90));
+        c.rect(px(0.8), y, px(1.2), y + 10, bgr(90, 200, 90));
         for m in [0.5f32, 1.0, 1.5, 2.0] {
             c.line(px(m), y + 10, px(m), y + 16, bgr(200, 200, 200));
             c.text(&format!("{m:.1}m"), px(m) - 14, y + 34, 0.45, bgr(190, 190, 190), false);
         }
         if let Some(d) = self.probe.dist {
-            let col = if (0.9..=1.3).contains(&d) { OK_GREEN } else { WARN };
+            let col = if (0.8..=1.2).contains(&d) { OK_GREEN } else { WARN };
             c.triangle([[px(d), y - 2], [px(d) - 9, y - 16], [px(d) + 9, y - 16]], col);
             c.text(&format!("{d:.2} m"), px(d) - 30, y - 22, 0.6, col, true);
         }

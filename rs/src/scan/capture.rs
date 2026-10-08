@@ -174,8 +174,25 @@ fn interior(depth: &[u16], r: usize) -> Vec<bool> {
 pub fn build_model(caps: &[Cap], world: &World, center: [f32; 2], prof: &Profile, y_range: (f32, f32), progress: &dyn Fn(&str, f32), log: &mut dyn FnMut(String)) -> Result<Mesh, String> {
     let pts: Vec<&[V3]> = caps.iter().map(|c| c.pts.as_slice()).collect();
     let poses: Vec<Pose> = caps.iter().map(|c| c.pose).collect();
+    if std::env::var("KINECT_DEBUG_POSES").is_ok() {
+        let l: Vec<String> = poses.iter().enumerate().step_by(5).map(|(i, p)| format!("{i}:{:.0}", p[0].to_degrees())).collect();
+        log(format!("raw yaw: {}", l.join(" ")));
+    }
     let poses = close_loops(&pts, &poses, prof.loops, log);
+    if std::env::var("KINECT_DEBUG_POSES").is_ok() {
+        let l: Vec<String> = poses.iter().enumerate().step_by(5).map(|(i, p)| format!("{i}:{:.0}", p[0].to_degrees())).collect();
+        log(format!("closed yaw: {}", l.join(" ")));
+    }
     let poses = if prof.refine_passes > 0 { refine_poses(&pts, &poses, prof.loops.max_d, prof.refine_passes, log) } else { poses };
+    let head_passes: usize = std::env::var("KINECT_HEAD_REFINE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let poses = if head_passes > 0 && prof.name == "bust" {
+        let cut = y_range.1 - 0.32;
+        let head: Vec<Vec<V3>> = pts.iter().map(|p| p.iter().copied().filter(|q| q[1] > cut).collect()).collect();
+        let hr: Vec<&[V3]> = head.iter().map(|h| h.as_slice()).collect();
+        refine_poses(&hr, &poses, 0.03, head_passes, log)
+    } else {
+        poses
+    };
     let step = ((caps.len() as f32 / prof.max_frames as f32).ceil() as usize).max(1);
     let use_idx: Vec<usize> = (0..caps.len()).step_by(step).collect();
     let col_ok: Vec<Vec<bool>> = use_idx.iter().map(|&i| interior(&caps[i].depth, 3)).collect();
