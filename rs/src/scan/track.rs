@@ -165,12 +165,16 @@ pub struct Tracker {
     vel: f64,
     last_phi: f64,
     pub quality: f64,
+    /// ICP correspondence limit (m) and the rms (m) below which a track is accepted.
+    max_d: f32,
+    rms_ok: f64,
 }
 
 const KEY_DEG: f64 = 12.0;
 
 impl Tracker {
-    pub fn new() -> Self { Tracker { key: None, grid: None, key_pose: [0.0; 3], pose: [0.0; 3], vel: 0.0, last_phi: 0.0, quality: 1.0 } }
+    pub fn new() -> Self { Tracker::with(0.10, 0.04) }
+    pub fn with(max_d: f32, rms_ok: f64) -> Self { Tracker { key: None, grid: None, key_pose: [0.0; 3], pose: [0.0; 3], vel: 0.0, last_phi: 0.0, quality: 1.0, max_d, rms_ok } }
     pub fn yaw(&self) -> f64 { self.pose[0] }
 
     pub fn add(&mut self, pts: &[V3]) -> Pose {
@@ -188,8 +192,8 @@ impl Tracker {
         let guess_phi = self.last_phi - self.key_pose[0] + self.vel;
         let r = mv(&rot2(guess_phi), c);
         let init = [guess_phi, c[0] - r[0], c[1] - r[1]];
-        let (rel, rms, frac) = icp_yaw(pts, key, self.grid.as_ref().unwrap(), init, 25, 0.10);
-        let ok = rms < 0.04 && frac > 0.35 && rel[0].abs() < 60f64.to_radians();
+        let (rel, rms, frac) = icp_yaw(pts, key, self.grid.as_ref().unwrap(), init, 25, self.max_d);
+        let ok = rms < self.rms_ok && frac > 0.35 && rel[0].abs() < 60f64.to_radians();
         self.quality = 0.85 * self.quality + 0.15 * if ok { 1.0 } else { 0.0 };
         let rel = if ok { rel } else { init }; // coast on the velocity estimate until tracking recovers
         self.pose = pose_compose(&self.key_pose, &rel);
@@ -206,7 +210,7 @@ impl Tracker {
 
     fn set_key(&mut self, pts: &[V3], pose: Pose) {
         self.key = Some(pts.to_vec());
-        self.grid = Some(Grid::new(pts, 0.12));
+        self.grid = Some(Grid::new(pts, self.max_d.max(0.03)));
         self.key_pose = pose;
         self.pose = pose;
         self.last_phi = pose[0];
@@ -218,7 +222,15 @@ impl Tracker {
 /// The frame that completes revolution j is found by geometry, not by the (biased) yaw estimate:
 /// candidates near j*360 degrees are ICP-matched against frame 0 from several starting angles and
 /// the best fit wins. Drift is then spread linearly between anchors.
-pub fn close_loops(pts_list: &[&[V3]], poses: &[Pose], log: &mut dyn FnMut(String)) -> Vec<Pose> {
+/// Loop-closure limits: ICP reach, accepted rms and the largest believable correction (all metres).
+#[derive(Clone, Copy)]
+pub struct LoopCfg {
+    pub max_d: f32,
+    pub rms: f64,
+    pub shift: f64,
+}
+
+pub fn close_loops(pts_list: &[&[V3]], poses: &[Pose], cfg: LoopCfg, log: &mut dyn FnMut(String)) -> Vec<Pose> {
     let k_n = poses.len();
     if k_n == 0 {
         return vec![];
@@ -229,7 +241,7 @@ pub fn close_loops(pts_list: &[&[V3]], poses: &[Pose], log: &mut dyn FnMut(Strin
     if revs < 1 || k_n < 8 {
         return poses.to_vec();
     }
-    let grid0 = Grid::new(pts_list[0], 0.12);
+    let grid0 = Grid::new(pts_list[0], cfg.max_d.max(0.03));
     let mut anchors: Vec<usize> = vec![0];
     let mut corr: Vec<Pose> = vec![[0.0; 3]];
     for j in 1..=revs {
@@ -240,7 +252,7 @@ pub fn close_loops(pts_list: &[&[V3]], poses: &[Pose], log: &mut dyn FnMut(Strin
             for off in [0.0f64, -20.0, 20.0, -35.0, 35.0] {
                 let mut init = poses[k];
                 init[0] = wrap_pi(init[0] + off.to_radians());
-                let (new, rms, frac) = icp_yaw(pts_list[k], pts_list[0], &grid0, init, 30, 0.12);
+                let (new, rms, frac) = icp_yaw(pts_list[k], pts_list[0], &grid0, init, 30, cfg.max_d);
                 let score = rms / frac.max(1e-3);
                 if frac > 0.5 && best.map_or(true, |b| score < b.0) {
                     best = Some((score, k, new, rms, frac));
@@ -257,7 +269,7 @@ pub fn close_loops(pts_list: &[&[V3]], poses: &[Pose], log: &mut dyn FnMut(Strin
         let c0 = [pts_list[0].iter().map(|p| p[0] as f64).sum::<f64>() / n0, pts_list[0].iter().map(|p| p[2] as f64).sum::<f64>() / n0];
         let r = mv(&rot2(e[0]), c0);
         let shift = ((r[0] + e[1] - c0[0]).powi(2) + (r[1] + e[2] - c0[1]).powi(2)).sqrt();
-        if rms > 0.04 || e[0].abs() > 60f64.to_radians() || shift > 0.25 {
+        if rms > cfg.rms || e[0].abs() > 60f64.to_radians() || shift > cfg.shift {
             log(format!("loop {j}: rejected (rms {rms:.3}, yaw {:+.1})", e[0].to_degrees()));
             continue;
         }

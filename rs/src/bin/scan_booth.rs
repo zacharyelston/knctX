@@ -339,7 +339,7 @@ impl Booth {
         let (prog, result) = (self.prog.clone(), self.result.clone());
         std::thread::spawn(move || {
             let p2 = prog.clone();
-            let built = build_model(&cap.caps, &world, center, &move |s, f| *p2.lock().unwrap() = (s.to_string(), f), &mut |s| println!("{s}"));
+            let built = build_model(&cap.caps, &world, center, &Profile::body(), (0.0, 2.1), &move |s, f| *p2.lock().unwrap() = (s.to_string(), f), &mut |s| println!("{s}"));
             let out: Built = match built {
                 Err(e) => Err(e),
                 Ok(mesh) => {

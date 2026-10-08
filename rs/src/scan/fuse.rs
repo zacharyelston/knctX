@@ -23,11 +23,21 @@ pub struct FrameRef<'a> {
     pub rgb: &'a [u8],
 }
 
-pub fn fuse(frames: &[FrameRef], poses: &[Pose], world: &World, center: [f32; 2], progress: &dyn Fn(usize, usize)) -> Volume {
-    let (voxel, trunc, radius, height) = (0.015f32, 0.06f32, 0.95f32, 2.1f32);
+/// Volume layout: voxel size, truncation, horizontal half-width, and the vertical span [y0, y0+height].
+#[derive(Clone, Copy)]
+pub struct FuseCfg {
+    pub voxel: f32,
+    pub trunc: f32,
+    pub radius: f32,
+    pub y0: f32,
+    pub height: f32,
+}
+
+pub fn fuse(frames: &[FrameRef], poses: &[Pose], world: &World, center: [f32; 2], cfg: FuseCfg, progress: &dyn Fn(usize, usize)) -> Volume {
+    let FuseCfg { voxel, trunc, radius, y0: ybase, height } = cfg;
     let n_of = |len: f32| (len / voxel).ceil() as usize;
     let dims = [n_of(2.0 * radius), n_of(height), n_of(2.0 * radius)];
-    let origin = [center[0] - radius + voxel / 2.0, voxel / 2.0, center[1] - radius + voxel / 2.0];
+    let origin = [center[0] - radius + voxel / 2.0, ybase + voxel / 2.0, center[1] - radius + voxel / 2.0];
     let n = dims[0] * dims[1] * dims[2];
     let mut vol = Volume { tsdf: vec![1.0; n], wt: vec![0.0; n], col: vec![[0.0; 3]; n], cwt: vec![0.0; n], dims, origin, voxel };
     let slab = dims[1] * dims[2];

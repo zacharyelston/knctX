@@ -30,6 +30,13 @@ impl Orbit3D {
 }
 
 pub fn render_mesh(c: &mut Canvas, verts: &[V3], normals: &[V3], faces: &[[u32; 3]], rgb: &[[u8; 3]], orbit: &Orbit3D, top: f32) {
+    let n = verts.len().max(1) as f32;
+    let focus = [verts.iter().map(|v| v[0]).sum::<f32>() / n, 0.5 * top, verts.iter().map(|v| v[2]).sum::<f32>() / n];
+    render_mesh_at(c, verts, normals, faces, rgb, orbit, focus, 3.3 * top / 1.75, true);
+}
+
+/// Render orbiting `focus` at `dist0` metres (before zoom); `ring` draws the floor circle.
+pub fn render_mesh_at(c: &mut Canvas, verts: &[V3], normals: &[V3], faces: &[[u32; 3]], rgb: &[[u8; 3]], orbit: &Orbit3D, focus: V3, dist0: f32, ring: bool) {
     let (wc, hc) = (c.w as i32, c.h as i32);
     for y in 0..c.h {
         let g = (46.0 + (20.0 - 46.0) * y as f32 / (c.h - 1) as f32) as u8;
@@ -37,13 +44,11 @@ pub fn render_mesh(c: &mut Canvas, verts: &[V3], normals: &[V3], faces: &[[u32; 
         c.buf[y * c.w..(y + 1) * c.w].iter_mut().for_each(|q| *q = p);
     }
     let f = 0.95 * c.h as f32;
-    let n = verts.len().max(1) as f32;
-    let focus = [verts.iter().map(|v| v[0]).sum::<f32>() / n, 0.5 * top, verts.iter().map(|v| v[2]).sum::<f32>() / n];
     let (cy, sy, cp, sp) = (orbit.yaw.cos(), orbit.yaw.sin(), orbit.pitch.cos(), orbit.pitch.sin());
     let ry: M3 = [[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]];
     let rx: M3 = [[1.0, 0.0, 0.0], [0.0, cp, -sp], [0.0, sp, cp]];
     let rv = mat_mul(&rx, &ry);
-    let dist = 3.3 * top / 1.75 / orbit.zoom;
+    let dist = dist0 / orbit.zoom;
     let project = |p: V3| -> (f32, f32, f32) {
         let q = mat_vec(&rv, sub(p, focus));
         let depth = dist - q[2];
@@ -52,7 +57,7 @@ pub fn render_mesh(c: &mut Canvas, verts: &[V3], normals: &[V3], faces: &[[u32; 
     };
     // floor ring for context
     let mut prev: Option<(i32, i32)> = None;
-    for i in 0..=72 {
+    for i in 0..=if ring { 72 } else { 0 } {
         let a = i as f32 / 72.0 * std::f32::consts::TAU;
         let (x, y, _) = project([focus[0] + 0.7 * a.cos(), 0.0, focus[2] + 0.7 * a.sin()]);
         let cur = (x as i32, y as i32);

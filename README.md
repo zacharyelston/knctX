@@ -48,10 +48,17 @@ and a rescan that took 40 s takes 7 s).
 cd rs
 cargo build --release
 ./target/release/scan_booth               # real Kinect (or --demo, --view DIR, --autorun NAME)
+./target/release/bust_booth              # seated close-up bust booth (--demo, --view DIR)
 ./target/release/rescan ../scans/<folder> # rebuild a saved scan (--refloor, --out DIR)
 ./target/release/kinect_overlay           # RGB + depth viewer (or --play ../recordings/<ts>)
 ./target/release/selftest                 # headless end-to-end check on the synthetic person
 ```
+
+The **bust booth** is for detail: the subject sits on a swivel chair about 1.1 m from the sensor and
+turns themselves once round (plus a little overlap). Head and shoulders are fused at 6 mm voxels
+(the full-body booth uses 15 mm). No floor is needed - the Kinect's accelerometer supplies gravity,
+so the sensor may be tilted (it auto-tilts to keep the head in frame). Rescans work the same way
+(`rescan` reads the profile saved in `raw/capture.json`).
 
 Needs only `libfreenect` (linked directly via FFI) - no OpenCV or Python. Notes: F11 fullscreen
 is not available (resize the window instead); the mesher is surface-nets rather than marching

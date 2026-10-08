@@ -7,10 +7,13 @@ pub struct Segmenter {
     pub world: World,
     pub center: Option<[f32; 2]>, // (x, z) world metres
     pub radius: f32,
+    /// Height gate (world y, metres) applied by `mask`.
+    pub y_lo: f32,
+    pub y_hi: f32,
 }
 
 impl Segmenter {
-    pub fn new(world: World) -> Self { Segmenter { world, center: None, radius: 0.95 } }
+    pub fn new(world: World) -> Self { Segmenter { world, center: None, radius: 0.95, y_lo: 0.08, y_hi: 2.3 } }
 
     /// Return (center_xz, height_m) of the nearest large upright object, or None.
     pub fn find_person(&mut self, depth: &[u16]) -> Option<([f32; 2], f32)> {
@@ -55,6 +58,53 @@ impl Segmenter {
         None
     }
 
+    /// Seated close-up: find the nearest large blob 0.5-1.9 m away. Sets the centre, a 0.45 m
+    /// radius and a height gate covering the top `bust_h` metres of the subject (head down to
+    /// mid-chest). Returns (centre_xz, top_y).
+    pub fn find_bust(&mut self, depth: &[u16], bust_h: f32) -> Option<([f32; 2], f32)> {
+        let mut pw: Vec<V3> = Vec::new();
+        let mut zc: Vec<f32> = Vec::new();
+        for v in (0..H).step_by(2) {
+            for u in (100..540).step_by(2) {
+                let z = depth[v * W + u] as f32 / 1000.0;
+                if z > 0.5 && z < 1.9 {
+                    pw.push(self.world.to_world(cam_point(u, v, z)));
+                    zc.push(z);
+                }
+            }
+        }
+        if pw.len() < 1500 {
+            return None;
+        }
+        let mut lo = 0.5f32;
+        while lo < 1.8 {
+            let n_win = zc.iter().filter(|&&z| z >= lo && z < lo + 0.15).count();
+            if n_win >= 900 {
+                let (mut xs, mut zs) = (Vec::new(), Vec::new());
+                for (p, &z) in pw.iter().zip(&zc) {
+                    if z >= lo - 0.05 && z < lo + 0.45 {
+                        xs.push(p[0]);
+                        zs.push(p[2]);
+                    }
+                }
+                let c = [median(&mut xs), median(&mut zs)];
+                let mut ys: Vec<f32> = pw.iter().filter(|p| (p[0] - c[0]).abs() < 0.45 && (p[2] - c[1]).abs() < 0.45).map(|p| p[1]).collect();
+                if ys.len() < 900 {
+                    lo += 0.05;
+                    continue;
+                }
+                let top = percentile(&mut ys, 99.5);
+                self.center = Some(c);
+                self.radius = 0.45;
+                self.y_hi = top + 0.05;
+                self.y_lo = top - bust_h;
+                return Some((c, top));
+            }
+            lo += 0.05;
+        }
+        None
+    }
+
     /// Mask (W*H bool) of the tracked person plus per-pixel world points.
     ///
     /// Pixels are gated by height above the floor and distance from the person, then cut along
@@ -71,7 +121,7 @@ impl Segmenter {
                 }
                 let p = self.world.to_world(cam_point(u, v, d as f32 / 1000.0));
                 pw[i] = p;
-                let mut ok = p[1] > 0.08 && p[1] < 2.3;
+                let mut ok = p[1] > self.y_lo && p[1] < self.y_hi;
                 if let Some(c) = self.center {
                     ok &= (p[0] - c[0]).abs() < self.radius && (p[2] - c[1]).abs() < self.radius;
                 }

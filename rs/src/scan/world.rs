@@ -151,3 +151,21 @@ pub fn nearest_distance(depth: &[u16]) -> Option<f32> {
         None
     }
 }
+
+/// World frame from a gravity reading (the sensor's accelerometer): y up, camera 1 m above the
+/// origin. Use when the floor isn't visible (close-up seated scans). `accel` is the raw reading in
+/// sensor axes. Returns None if it is implausible.
+pub fn world_from_accel(accel: [f64; 3]) -> Option<World> {
+    // sensor axes -> camera axes (x right, y down, z forward): the sensor's y points up (verified
+    // against floor fits at several tilts)
+    let a = [accel[0] as f32, -accel[1] as f32, accel[2] as f32];
+    let m = norm(a);
+    if !(8.0..11.5).contains(&m) {
+        return None;
+    }
+    let u = scale(a, 1.0 / m); // up, in camera axes (x right, y down, z forward)
+    let ex: V3 = [1.0, 0.0, 0.0];
+    let xw = normalize(sub(ex, scale(u, dot(ex, u))));
+    let zw = cross(xw, u);
+    Some(World { r: [xw, u, zw], t: [0.0, 1.0, 0.0], floor_found: true })
+}

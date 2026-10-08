@@ -16,6 +16,7 @@ pub struct Store {
     pub seq: AtomicU64,
     pub tilt: AtomicI32,
     pub running: AtomicBool,
+    accel: Mutex<Option<[f64; 3]>>,
 }
 
 impl Store {
@@ -25,6 +26,7 @@ impl Store {
             seq: AtomicU64::new(0),
             tilt: AtomicI32::new(0),
             running: AtomicBool::new(true),
+            accel: Mutex::new(None),
         })
     }
     pub fn put_rgb(&self, rgb: Vec<u8>) { self.frames.lock().unwrap().0 = Some(Arc::new(rgb)); }
@@ -36,6 +38,7 @@ impl Store {
         *self.frames.lock().unwrap() = (Some(Arc::new(rgb)), Some(Arc::new(d)));
         self.seq.fetch_add(1, Ordering::SeqCst);
     }
+    pub fn set_accel(&self, a: Option<[f64; 3]>) { *self.accel.lock().unwrap() = a; }
     pub fn clear(&self) { *self.frames.lock().unwrap() = (None, None); }
 }
 
@@ -50,6 +53,8 @@ pub trait Source: Send + Sync {
             _ => None,
         }
     }
+    /// Accelerometer reading in the sensor's own axes (m/s^2), if the source has one.
+    fn accel(&self) -> Option<[f64; 3]> { *self.store().accel.lock().unwrap() }
     fn seq(&self) -> u64 { self.store().seq.load(Ordering::SeqCst) }
     fn tilt_target(&self) -> i32 { self.store().tilt.load(Ordering::SeqCst) }
     fn set_tilt(&self, deg: i32) { self.store().tilt.store(deg.clamp(-30, 30), Ordering::SeqCst); }
@@ -111,6 +116,9 @@ extern "C" {
     fn freenect_stop_depth(dev: *mut c_void) -> i32;
     fn freenect_stop_video(dev: *mut c_void) -> i32;
     fn freenect_set_tilt_degs(dev: *mut c_void, angle: f64) -> i32;
+    fn freenect_update_tilt_state(dev: *mut c_void) -> i32;
+    fn freenect_get_tilt_state(dev: *mut c_void) -> *mut c_void;
+    fn freenect_get_mks_accel(state: *mut c_void, x: *mut f64, y: *mut f64, z: *mut f64);
 }
 
 struct Shared {
@@ -184,11 +192,20 @@ impl Kinect {
                 freenect_start_depth(dev);
                 freenect_start_video(dev);
                 let mut sent: Option<i32> = None;
+                let mut last_accel = Instant::now();
                 while store.running.load(Ordering::SeqCst) && !restart {
                     let mut tv = TimeVal { sec: 0, usec: 100_000 };
                     if freenect_process_events_timeout(ctx, &mut tv) < 0 {
                         restart = true;
                         break;
+                    }
+                    if last_accel.elapsed() > Duration::from_millis(400) {
+                        last_accel = Instant::now();
+                        if freenect_update_tilt_state(dev) >= 0 {
+                            let (mut x, mut y, mut z) = (0.0, 0.0, 0.0);
+                            freenect_get_mks_accel(freenect_get_tilt_state(dev), &mut x, &mut y, &mut z);
+                            store.set_accel(Some([x, y, z]));
+                        }
                     }
                     let want = store.tilt.load(Ordering::SeqCst);
                     if sent != Some(want) {

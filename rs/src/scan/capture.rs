@@ -1,5 +1,5 @@
 //! Capture (tracked, masked frames), raw saving, rescan from raw, and the full model build.
-use super::fuse::{fuse, FrameRef};
+use super::fuse::{fuse, FrameRef, FuseCfg};
 use super::mesh::{extract_mesh, Mesh};
 use super::rig::Figure;
 use super::segment::Segmenter;
@@ -12,6 +12,38 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Instant;
 
+/// Everything that differs between the full-body and the seated-bust booth.
+#[derive(Clone, Copy)]
+pub struct Profile {
+    pub name: &'static str,
+    pub min_mask_px: usize,
+    pub min_pts: usize,
+    pub track_pts: usize,
+    /// Tracking points are limited to this world-height band (None = the segmenter's own gate).
+    pub track_y: Option<(f32, f32)>,
+    pub icp_max_d: f32,
+    pub icp_rms: f64,
+    pub loops: LoopCfg,
+    pub voxel: f32,
+    pub trunc: f32,
+    pub radius: f32,
+    pub max_frames: usize,
+    pub min_extent: f32,
+    pub smooth: usize,
+}
+
+impl Profile {
+    pub fn body() -> Profile {
+        Profile { name: "body", min_mask_px: 3000, min_pts: 1500, track_pts: 3000, track_y: Some((0.15, 1.9)), icp_max_d: 0.10, icp_rms: 0.04,
+                  loops: LoopCfg { max_d: 0.12, rms: 0.04, shift: 0.25 }, voxel: 0.015, trunc: 0.06, radius: 0.95, max_frames: 110, min_extent: 0.3, smooth: 8 }
+    }
+    pub fn bust() -> Profile {
+        Profile { name: "bust", min_mask_px: 6000, min_pts: 3000, track_pts: 6000, track_y: None, icp_max_d: 0.05, icp_rms: 0.02,
+                  loops: LoopCfg { max_d: 0.05, rms: 0.02, shift: 0.10 }, voxel: 0.006, trunc: 0.025, radius: 0.40, max_frames: 150, min_extent: 0.25, smooth: 4 }
+    }
+    pub fn by_name(n: &str) -> Profile { if n == "bust" { Profile::bust() } else { Profile::body() } }
+}
+
 pub struct Cap {
     pub depth: Vec<u16>, // masked
     pub rgb: Rgb,
@@ -21,6 +53,7 @@ pub struct Cap {
 
 /// Turns raw (rgb, depth) frames into tracked, masked captures ready for fusion.
 pub struct Capture {
+    pub profile: Profile,
     pub seg: Segmenter,
     pub trk: Tracker,
     pub caps: Vec<Cap>,
@@ -28,21 +61,25 @@ pub struct Capture {
 }
 
 impl Capture {
-    pub fn new(seg: Segmenter) -> Self { Capture { seg, trk: Tracker::new(), caps: Vec::new(), mask_px: Vec::new() } }
+    pub fn new(seg: Segmenter) -> Self { Capture::with(seg, Profile::body()) }
+    pub fn with(seg: Segmenter, profile: Profile) -> Self {
+        Capture { profile, seg, trk: Tracker::with(profile.icp_max_d, profile.icp_rms), caps: Vec::new(), mask_px: Vec::new() }
+    }
 
     /// Returns (mask, used). `used` is false when the person wasn't usable in this frame.
     pub fn add(&mut self, rgb: &Rgb, depth: &[u16]) -> (Vec<bool>, bool) {
         let (m, pw) = self.seg.mask(depth);
         let npx = m.iter().filter(|b| **b).count();
-        if npx < 3000 {
+        if npx < self.profile.min_mask_px {
             return (m, false);
         }
         // no floor / overhead: static points bias the spin tracker
-        let p: Vec<V3> = (0..W * H).filter(|&i| m[i] && pw[i][1] > 0.15 && pw[i][1] < 1.9).map(|i| pw[i]).collect();
-        if p.len() < 1500 {
+        let (ylo, yhi) = self.profile.track_y.unwrap_or((f32::NEG_INFINITY, f32::INFINITY));
+        let p: Vec<V3> = (0..W * H).filter(|&i| m[i] && pw[i][1] > ylo && pw[i][1] < yhi).map(|i| pw[i]).collect();
+        if p.len() < self.profile.min_pts {
             return (m, false);
         }
-        let step = (p.len() / 3000).max(1);
+        let step = (p.len() / self.profile.track_pts).max(1);
         let pts: Vec<V3> = p.iter().step_by(step).copied().collect();
         let pose = self.trk.add(&pts);
         let masked: Vec<u16> = (0..W * H).map(|i| if m[i] { depth[i] } else { 0 }).collect();
@@ -124,18 +161,19 @@ fn interior(depth: &[u16], r: usize) -> Vec<bool> {
     out
 }
 
-pub fn build_model(caps: &[Cap], world: &World, center: [f32; 2], progress: &dyn Fn(&str, f32), log: &mut dyn FnMut(String)) -> Result<Mesh, String> {
+pub fn build_model(caps: &[Cap], world: &World, center: [f32; 2], prof: &Profile, y_range: (f32, f32), progress: &dyn Fn(&str, f32), log: &mut dyn FnMut(String)) -> Result<Mesh, String> {
     let pts: Vec<&[V3]> = caps.iter().map(|c| c.pts.as_slice()).collect();
     let poses: Vec<Pose> = caps.iter().map(|c| c.pose).collect();
-    let poses = close_loops(&pts, &poses, log);
-    let step = ((caps.len() as f32 / 110.0).ceil() as usize).max(1);
+    let poses = close_loops(&pts, &poses, prof.loops, log);
+    let step = ((caps.len() as f32 / prof.max_frames as f32).ceil() as usize).max(1);
     let use_idx: Vec<usize> = (0..caps.len()).step_by(step).collect();
     let col_ok: Vec<Vec<bool>> = use_idx.iter().map(|&i| interior(&caps[i].depth, 3)).collect();
     let frames: Vec<FrameRef> = use_idx.iter().zip(&col_ok).map(|(&i, ok)| FrameRef { depth: &caps[i].depth, col_ok: ok, rgb: &caps[i].rgb }).collect();
     let up: Vec<Pose> = use_idx.iter().map(|&i| poses[i]).collect();
-    let vol = fuse(&frames, &up, world, center, &|k, n| progress("Fusing depth", 0.1 + 0.7 * k as f32 / n as f32));
+    let cfg = FuseCfg { voxel: prof.voxel, trunc: prof.trunc, radius: prof.radius, y0: y_range.0, height: y_range.1 - y_range.0 };
+    let vol = fuse(&frames, &up, world, center, cfg, &|k, n| progress("Fusing depth", 0.1 + 0.7 * k as f32 / n as f32));
     progress("Building mesh", 0.85);
-    extract_mesh(&vol, 2.0, 8)
+    extract_mesh(&vol, 2.0, prof.smooth, prof.min_extent)
 }
 
 pub struct RescanStats {
@@ -167,13 +205,22 @@ pub fn rescan(folder: &Path, out: Option<&Path>, log: &mut dyn FnMut(String), re
             None => log("refit floor: FAILED, keeping the saved one".into()),
         }
     }
+    let prof = Profile::by_name(cfg["profile"].as_str().unwrap_or("body"));
     let mut seg = Segmenter::new(world);
+    let mut y_range = (0.0f32, 2.1f32);
+    if prof.name == "bust" {
+        let (lo, hi) = (f(&cfg["y_lo"]), f(&cfg["y_hi"]));
+        seg.y_lo = lo;
+        seg.y_hi = hi;
+        seg.radius = 0.45;
+        y_range = (lo, hi);
+    }
     if let (Some(c), false) = (cfg["center"].as_array(), refloor) {
         seg.center = Some([f(&c[0]), f(&c[1])]);
-    } else if seg.find_person(&d0).is_none() {
+    } else if prof.name == "body" && seg.find_person(&d0).is_none() {
         return Err("no person found in the first raw frame".into());
     }
-    let mut cap = Capture::new(seg);
+    let mut cap = Capture::with(seg, prof);
     for i in 0..n {
         if let Some((rgb, depth)) = load(i) {
             cap.add(&std::sync::Arc::new(rgb), &depth);
@@ -189,7 +236,7 @@ pub fn rescan(folder: &Path, out: Option<&Path>, log: &mut dyn FnMut(String), re
         let nn = p.len() as f32;
         [p.iter().map(|q| q[0]).sum::<f32>() / nn, p.iter().map(|q| q[2]).sum::<f32>() / nn]
     };
-    let mesh = build_model(&cap.caps, &world, c0, &|_, _| {}, log)?;
+    let mesh = build_model(&cap.caps, &world, c0, &prof, y_range, &|_, _| {}, log)?;
     let out = out.map(|p| p.to_path_buf()).unwrap_or_else(|| folder.join(format!("rescan_{}", timestamp("%H%M%S"))));
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
     io::save_ply(&out.join("model.ply"), &mesh.verts, &mesh.faces, &mesh.rgb).map_err(|e| e.to_string())?;

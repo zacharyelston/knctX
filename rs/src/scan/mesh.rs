@@ -28,7 +28,7 @@ pub fn vertex_normals(verts: &[V3], faces: &[[u32; 3]]) -> Vec<V3> {
     vn.into_iter().map(normalize).collect()
 }
 
-pub fn extract_mesh(vol: &Volume, min_obs: f32, smooth_iters: usize) -> Result<Mesh, String> {
+pub fn extract_mesh(vol: &Volume, min_obs: f32, smooth_iters: usize, min_extent: f32) -> Result<Mesh, String> {
     let [nx, ny, nz] = vol.dims;
     let idx = |i: usize, j: usize, k: usize| (i * ny + j) * nz + k;
     if vol.wt.iter().filter(|w| **w >= min_obs).count() < 1000 {
@@ -144,7 +144,7 @@ pub fn extract_mesh(vol: &Volume, min_obs: f32, smooth_iters: usize) -> Result<M
         ymax[r as usize] = ymax[r as usize].max(verts[v][1]);
     }
     let smax = *size.iter().max().unwrap();
-    let mut good: Vec<bool> = (0..nv).map(|r| size[r] > 0 && size[r] as f32 >= 0.05 * smax as f32 && ymax[r] - ymin[r] > 0.3).collect();
+    let mut good: Vec<bool> = (0..nv).map(|r| size[r] > 0 && size[r] as f32 >= 0.05 * smax as f32 && ymax[r] - ymin[r] > min_extent).collect();
     if !good.iter().any(|g| *g) {
         good = (0..nv).map(|r| size[r] == smax).collect();
     }
