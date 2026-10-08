@@ -1,5 +1,5 @@
 //! Capture (tracked, masked frames), raw saving, rescan from raw, and the full model build.
-use super::fuse::{fuse, FrameRef, FuseCfg};
+use super::fuse::{fuse, hull_fill, FrameRef, FuseCfg};
 use super::mesh::{extract_mesh, Mesh};
 use super::rig::Figure;
 use super::segment::Segmenter;
@@ -204,6 +204,11 @@ pub fn build_model(caps: &[Cap], world: &World, center: [f32; 2], prof: &Profile
     let envf = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
     let cfg = FuseCfg { voxel: prof.voxel, trunc: envf("KINECT_TRUNC", prof.trunc), radius: prof.radius, y0: y_range.0, height: y_range.1 - y_range.0 };
     let vol = fuse(&frames, &up, world, center, cfg, &|k, n| progress("Fusing depth", 0.1 + 0.7 * k as f32 / n as f32));
+    let mut vol = vol;
+    if prof.name == "bust" && std::env::var("KINECT_NO_HULL").is_err() {
+        let n = hull_fill(&mut vol, &frames, &up, world, center, envf("KINECT_HULL_H", 0.6), envf("KINECT_HULL_REACH", 0.04), envf("KINECT_HULL_FRAC", 0.97));
+        log(format!("hull fill: +{n} voxels"));
+    }
     progress("Building mesh", 0.85);
     extract_mesh(&vol, envf("KINECT_MINOBS", 2.0), envf("KINECT_SMOOTH", prof.smooth as f32) as _, prof.min_extent)
 }

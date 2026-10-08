@@ -122,3 +122,109 @@ fn view_weights(depth: &[u16]) -> Vec<f32> {
     }
     out
 }
+
+/// Silhouette mask with small holes closed (hair and glasses lose depth inside the head outline).
+fn closed_mask(depth: &[u16], gap: usize) -> Vec<bool> {
+    let mut m: Vec<bool> = depth.iter().map(|d| *d > 0).collect();
+    let close_run = |m: &mut Vec<bool>, idx: &dyn Fn(usize) -> usize, len: usize, lines: usize| {
+        for l in 0..lines {
+            let mut last: Option<usize> = None;
+            for k in 0..len {
+                let p = idx(l * len + k);
+                if m[p] {
+                    if let Some(a) = last {
+                        if k - a > 1 && k - a <= gap {
+                            for q in a + 1..k {
+                                m[idx(l * len + q)] = true;
+                            }
+                        }
+                    }
+                    last = Some(k);
+                }
+            }
+        }
+    };
+    let snapshot = m.clone();
+    close_run(&mut m, &|i| i, W, H);
+    let rows = m.clone();
+    m = snapshot;
+    close_run(&mut m, &|i| (i % H) * W + i / H, H, W);
+    for (a, b) in m.iter_mut().zip(rows) {
+        *a = *a && b;
+    }
+    m
+}
+
+/// Fill the head out to its silhouettes: hair returns little infrared and its depth reads too deep,
+/// which carves the head thin. A voxel seen inside the silhouette in (nearly) every frame is solid;
+/// grow the fused surface into such voxels, at most `reach` metres.
+pub fn hull_fill(vol: &mut Volume, frames: &[FrameRef], poses: &[Pose], world: &World, center: [f32; 2], head_h: f32, reach: f32, min_frac: f32) -> usize {
+    let [nx, ny, nz] = vol.dims;
+    let slab = ny * nz;
+    // top of the fused solid
+    let mut top = 0;
+    for j in 0..ny {
+        let n = (0..nx).map(|i| (0..nz).filter(|k| vol.tsdf[i * slab + j * nz + k] < 0.0 && vol.wt[i * slab + j * nz + k] >= 2.0).count()).sum::<usize>();
+        if n >= 60 {
+            top = j;
+        }
+    }
+    let j0 = top.saturating_sub((head_h / vol.voxel) as usize);
+    let masks: Vec<Vec<bool>> = frames.iter().map(|f| closed_mask(f.depth, 30)).collect();
+    let (origin, voxel) = (vol.origin, vol.voxel);
+    let inside: Vec<bool> = (0..nx * ny * nz)
+        .into_par_iter()
+        .map(|id| {
+            let (i, j, k) = (id / slab, (id / nz) % ny, id % nz);
+            if j < j0 || j > top {
+                return false;
+            }
+            let (vx, vy, vz) = (origin[0] + i as f32 * voxel, origin[1] + j as f32 * voxel, origin[2] + k as f32 * voxel);
+            let (mut seen, mut hit) = (0u32, 0u32);
+            for (f, m) in poses.iter().zip(&masks) {
+                let (c, s) = (f[0].cos() as f32, f[0].sin() as f32);
+                let (dx, dz) = (vx - f[1] as f32, vz - f[2] as f32);
+                let pc = world.to_camera([c * dx + s * dz, vy, -s * dx + c * dz]);
+                if pc[2] <= 0.3 {
+                    continue;
+                }
+                let u = (FX * pc[0] / pc[2] + CX).round();
+                let v = (FY * pc[1] / pc[2] + CY).round();
+                if u < 0.0 || v < 0.0 || u >= W as f32 || v >= H as f32 {
+                    continue;
+                }
+                seen += 1;
+                if m[v as usize * W + u as usize] {
+                    hit += 1;
+                }
+            }
+            seen >= 20 && hit as f32 >= min_frac * seen as f32
+        })
+        .collect();
+    let mut solid: Vec<bool> = (0..nx * ny * nz).map(|id| vol.tsdf[id] < 0.0 && vol.wt[id] >= 2.0).collect();
+    let mut added = 0;
+    for _ in 0..(reach / voxel).ceil() as usize {
+        let mut grow = Vec::new();
+        for i in 1..nx - 1 {
+            for j in j0.max(1)..=top.min(ny - 2) {
+                for k in 1..nz - 1 {
+                    let id = i * slab + j * nz + k;
+                    if solid[id] || !inside[id] {
+                        continue;
+                    }
+                    if solid[id - slab] || solid[id + slab] || solid[id - nz] || solid[id + nz] || solid[id - 1] || solid[id + 1] {
+                        grow.push(id);
+                    }
+                }
+            }
+        }
+        for id in grow {
+            solid[id] = true;
+            vol.tsdf[id] = -0.3;
+            vol.wt[id] = vol.wt[id].max(2.5);
+            added += 1;
+        }
+    }
+    let _ = center;
+    added
+}
