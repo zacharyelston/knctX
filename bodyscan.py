@@ -141,24 +141,41 @@ class Segmenter:
         return None
 
     def mask(self, depth):
-        """Return (mask HxW bool, world points HxWx3) for the tracked person."""
+        """Return (mask HxW bool, world points HxWx3) for the tracked person.
+
+        Pixels are gated by height above the floor and distance from the person, then cut
+        along depth discontinuities so chairs/desks behind them don't join the person.
+        """
         pw = self.world_points(depth)
-        valid = depth > 0
-        m = valid & (pw[..., 1] > 0.04) & (pw[..., 1] < 2.3)
+        m = (depth > 0) & (pw[..., 1] > 0.08) & (pw[..., 1] < 2.3)
         if self.center is not None:
             m &= (np.abs(pw[..., 0] - self.center[0]) < self.radius) & (np.abs(pw[..., 2] - self.center[1]) < self.radius)
-        m = cv2.erode(m.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
-        # drop flying pixels at depth discontinuities
-        med = cv2.medianBlur(depth, 5)
-        m &= np.abs(depth.astype(np.int32) - med.astype(np.int32)) < 40
-        # keep the largest connected blob
-        n, lab, stats, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), connectivity=8)
+        d32 = depth.astype(np.int32)
+        cut = np.zeros(m.shape, bool)
+        jx = np.abs(np.diff(d32, axis=1)) > 50
+        jy = np.abs(np.diff(d32, axis=0)) > 50
+        cut[:, 1:] |= jx
+        cut[:, :-1] |= jx
+        cut[1:, :] |= jy
+        cut[:-1, :] |= jy
+        core = cv2.erode((m & ~cut).astype(np.uint8), np.ones((3, 3), np.uint8))
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(core, connectivity=8)
+        keep = np.zeros(m.shape, bool)
         if n > 1:
-            m = lab == (1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA])))
-        if m.sum() > 500:
-            c = pw[m][:, [0, 2]].mean(0)
+            areas = stats[1:, cv2.CC_STAT_AREA]
+            big = int(np.argmax(areas))
+            keep = lab == (1 + big)
+            cb = pw[keep][::7][:, [0, 2]].mean(0)
+            for i in np.argsort(-areas)[1:6]:  # arms/hands that got cut off from the torso
+                if areas[i] < 0.03 * areas[big]:
+                    break
+                comp = lab == (1 + i)
+                if np.linalg.norm(pw[comp][::5][:, [0, 2]].mean(0) - cb) < 0.5:
+                    keep |= comp
+        if keep.sum() > 500:
+            c = pw[keep][::7][:, [0, 2]].mean(0)
             self.center = c if self.center is None else (0.8 * self.center + 0.2 * c)
-        return m, pw
+        return keep, pw
 
 
 # --------------------------------------------------------------------------- 2d rigid poses
@@ -290,6 +307,105 @@ def close_loops(pts_list, poses, log=None):
     return out
 
 
+class Capture:
+    """Turns raw (rgb, depth) frames into tracked, masked captures ready for fusion."""
+
+    def __init__(self, world, seg):
+        self.world, self.seg = world, seg
+        self.trk = Tracker()
+        self.caps = []
+        self.mask_px = []
+
+    def add(self, rgb, depth):
+        """Returns (mask, used). `used` is False when the person wasn't usable in this frame."""
+        m, pw = self.seg.mask(depth)
+        if int(m.sum()) < 3000:
+            return m, False
+        p = pw[m]
+        p = p[(p[:, 1] > 0.15) & (p[:, 1] < 1.9)]  # no floor / overhead: static points bias the spin tracker
+        if len(p) < 1500:
+            return m, False
+        pts = p[:: max(1, len(p) // 3000)].astype(np.float32)
+        pose = self.trk.add(pts)
+        self.caps.append(dict(depth=np.where(m, depth, 0).astype(np.uint16), rgb=rgb, pts=pts, pose=pose))
+        self.mask_px.append(int(m.sum()))
+        return m, True
+
+
+class RawSaver:
+    """Writes every captured frame (unmasked rgb jpg + 16-bit depth png) so scans can be re-processed."""
+
+    def __init__(self, folder):
+        import queue
+        import threading
+        self.dir = Path(folder) / "raw"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.q = queue.Queue(maxsize=400)
+        self.n = 0
+        self.times = []
+        self.t0 = time.time()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def add(self, rgb, depth):
+        try:
+            self.q.put_nowait((self.n, rgb, depth))
+        except Exception:  # queue full: drop rather than stall the capture
+            return
+        self.times.append(time.time() - self.t0)
+        self.n += 1
+
+    def _run(self):
+        while True:
+            item = self.q.get()
+            if item is None:
+                return
+            i, rgb, depth = item
+            cv2.imwrite(str(self.dir / f"rgb_{i:05d}.jpg"), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 92])
+            cv2.imwrite(str(self.dir / f"depth_{i:05d}.png"), depth, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+
+    def finish(self, world, center=None, extra=None):
+        self.q.put(None)
+        self.thread.join()
+        info = dict(frames=self.n, times=self.times, world_R=world.R.tolist(), world_t=world.t.tolist(),
+                    floor_found=bool(world.floor_found),
+                    center=None if center is None else [float(x) for x in center],
+                    intrinsics=dict(fx=FX, fy=FY, cx=CX, cy=CY))
+        info.update(extra or {})
+        (self.dir / "capture.json").write_text(json.dumps(info))
+
+
+def rescan(folder, out=None, log=print):
+    """Rebuild a model from a saved raw capture (`<scan>/raw`). Returns (out_folder, stats)."""
+    folder = Path(folder)
+    raw = folder / "raw"
+    cfg = json.loads((raw / "capture.json").read_text())
+    n = cfg["frames"]
+    load = lambda i: (cv2.cvtColor(cv2.imread(str(raw / f"rgb_{i:05d}.jpg")), cv2.COLOR_BGR2RGB),  # noqa: E731
+                      cv2.imread(str(raw / f"depth_{i:05d}.png"), cv2.IMREAD_UNCHANGED))
+    rgb0, d0 = load(0)
+    world = World(np.array(cfg["world_R"]), np.array(cfg["world_t"]), cfg["floor_found"])
+    seg = Segmenter(world)
+    if cfg.get("center"):
+        seg.center = np.array(cfg["center"], np.float32)
+    elif seg.find_person(d0) is None:
+        raise RuntimeError("no person found in the first raw frame")
+    cap = Capture(world, seg)
+    for i in range(n):
+        rgb, depth = load(i)
+        cap.add(rgb, depth)
+    stats = dict(frames=n, used=len(cap.caps), turns=abs(cap.trk.yaw) / (2 * np.pi), quality=cap.trk.quality,
+                 mean_mask_px=float(np.mean(cap.mask_px)) if cap.mask_px else 0)
+    log(f"rescan: {stats}")
+    center = cap.caps[0]["pts"][:, [0, 2]].mean(0)
+    verts, faces, rgb = build_model(cap.caps, world, center, log=log)
+    out = Path(out) if out else folder / f"rescan_{time.strftime('%H%M%S')}"
+    out.mkdir(parents=True, exist_ok=True)
+    save_ply(out / "model.ply", verts, faces, rgb)
+    save_obj(out / "model.obj", verts, faces, rgb)
+    return out, stats, cap
+
+
 # --------------------------------------------------------------------------- TSDF fusion
 
 def fuse(frames, poses, world, center, voxel=0.015, trunc=0.06, radius=0.95, height=2.1,
@@ -372,7 +488,14 @@ def extract_mesh(vol, min_obs=2, smooth_iters=8):
     A = _adjacency(len(v), f)
     n, lab = csgraph.connected_components(A, directed=False)
     sizes = np.bincount(lab)
-    keep = np.isin(lab, np.nonzero(sizes >= 0.05 * sizes.max())[0])  # drop only small floaters
+    ymin = np.full(n, np.inf)
+    ymax = np.full(n, -np.inf)
+    np.minimum.at(ymin, lab, v[:, 1])
+    np.maximum.at(ymax, lab, v[:, 1])
+    good = (sizes >= 0.05 * sizes.max()) & ((ymax - ymin) > 0.3)  # drop floaters and flat floor scraps
+    if not good.any():
+        good = sizes == sizes.max()
+    keep = np.isin(lab, np.nonzero(good)[0])
     remap = -np.ones(len(v), np.int32)
     remap[keep] = np.arange(keep.sum())
     f = remap[f]
@@ -739,9 +862,14 @@ def safe_name(name):
     return keep or "visitor"
 
 
-def save_scan(root, name, verts, faces, rgb, fig=None, thumb=None):
+def new_scan_folder(root, name):
     folder = Path(root) / f"{safe_name(name).replace(' ', '_')}_{time.strftime('%Y%m%d_%H%M%S')}"
     folder.mkdir(parents=True)
+    return folder
+
+
+def save_scan(folder, name, verts, faces, rgb, fig=None, thumb=None):
+    folder = Path(folder)
     save_ply(folder / "model.ply", verts, faces, rgb)
     save_obj(folder / "model.obj", verts, faces, rgb)
     meta = dict(name=name, created=time.strftime("%Y-%m-%d %H:%M:%S"), vertices=len(verts), faces=len(faces))

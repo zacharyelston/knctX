@@ -11,6 +11,8 @@ Viewer keys: 1-6 poses, drag = orbit, wheel = zoom, a = auto-spin, 0 = reset vie
              s = export current pose (+ screenshot), n = new scan, F11 = fullscreen, Esc = quit.
 """
 import argparse
+import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -79,6 +81,8 @@ class Booth:
         self.prog = ("", 0.0)
         self.error = ""
         self.fullscreen = False
+        self.force_until = 0.0
+        self.raw = None
         if view_dir:
             self._open_saved(Path(view_dir))
 
@@ -161,8 +165,10 @@ class Booth:
         self.state, self.t_state = "COUNTDOWN", time.time()
 
     def _start_capture(self):
-        self.trk = bs.Tracker()
-        self.caps = []
+        self.folder = bs.new_scan_folder(self.root, self.name)
+        self.raw = bs.RawSaver(self.folder)
+        self.cap = bs.Capture(self.world, self.seg)
+        self.center0 = None
         self.last_seq, self.last_t = -1, 0.0
         self.last_mask = None
         self.visible = True
@@ -174,16 +180,21 @@ class Booth:
         if rgb is None or seq == self.last_seq or time.time() - self.last_t < 0.07:
             return rgb
         self.last_seq, self.last_t = seq, time.time()
-        m, pw = self.seg.mask(depth)
+        m, used = self.cap.add(rgb, depth)
         self.last_mask = m
-        self.visible = int(m.sum()) > 3000
-        if not self.visible:
-            return rgb
-        pts = pw[m]
-        pts = pts[:: max(1, len(pts) // 3000)].astype(np.float32)
-        pose = self.trk.add(pts)
-        self.caps.append(dict(depth=np.where(m, depth, 0).astype(np.uint16), rgb=rgb, pts=pts, pose=pose))
+        self.visible = used
+        if used:
+            self.raw.add(rgb, depth)
+            if self.center0 is None:
+                self.center0 = self.cap.caps[0]["pts"][:, [0, 2]].mean(0)
         return rgb
+
+    def _finish_raw(self, extra=None):
+        if self.raw is not None:
+            q = self.cap
+            self.raw.finish(self.world, self.center0, dict(online_turns=abs(q.trk.yaw) / (2 * np.pi),
+                                                           quality=q.trk.quality, name=self.name, **(extra or {})))
+            self.raw = None
 
     def _start_process(self):
         self.state, self.t_state = "PROCESS", time.time()
@@ -192,26 +203,26 @@ class Booth:
 
     def _process(self):
         try:
-            caps = self.caps
-            center = caps[0]["pts"][:, [0, 2]].mean(0)
+            caps = self.cap.caps
+            center = self.center0
             verts, faces, rgb = bs.build_model(caps, self.world, center,
                                                progress=lambda s, f: setattr(self, "prog", (s, f)), log=print)
             self.prog = ("Rigging the skeleton", 0.93)
             fig = bs.Figure(verts, faces, rgb)
             thumb = bs.render_mesh(verts, fig.rest_normals, faces, rgb[:, ::-1].copy(), bs.Orbit3D(),
                                    size=(CH, CW), top=fig.top)
-            self.folder = bs.save_scan(self.root, self.name, verts, faces, rgb, fig, thumb)
+            bs.save_scan(self.folder, self.name, verts, faces, rgb, fig, thumb)
             print("saved scan:", self.folder)
             self.fig = fig
             self.cur, self.pose_i, self.t_view = {}, 0, time.time()
             self.orbit.reset()
-            self.caps = []
+            self.cap = None
             self.state = "VIEW"
         except Exception as e:  # noqa: BLE001 - show any failure to the operator
             import traceback
             traceback.print_exc()
             self.error = str(e)
-            self.caps = []
+            self.cap = None
             self.state = "NAME"
             self.toast(f"Scan failed: {e}", 6)
 
@@ -231,10 +242,13 @@ class Booth:
         elif key in KEY_DOWN:
             self.src.tilt_target = max(-30, self.src.tilt_target - 5)
         elif key in KEY_ENTER:
-            if self.name.strip():
+            if not self.name.strip():
+                self.toast("Please type your name first")
+            elif self.probe["ok"] or time.time() < self.force_until:
                 self._start_countdown()
             else:
-                self.toast("Please type your name first")
+                self.force_until = time.time() + 6
+                self.toast(f"Not ready: {self.probe['text']}.  Press ENTER again to scan anyway", 6)
         elif key in KEY_BACK:
             self.name = self.name[:-1]
         elif 32 <= key < 127 and len(self.name) < 24:
@@ -283,15 +297,19 @@ class Booth:
 
     def _tick_capture(self, key):
         rgb = self._sample()
-        turns = abs(self.trk.yaw) / (2 * np.pi)
+        turns = abs(self.cap.trk.yaw) / (2 * np.pi)
         elapsed = time.time() - self.t_state
+        ncap = len(self.cap.caps)
         if key == 27:
+            self._finish_raw(dict(result="cancelled"))
             self.state = "NAME"
             self.toast("Scan cancelled")
-        elif (key == 32 and turns >= 1.0) or turns >= TURNS_NEEDED * 0.985 or len(self.caps) >= 300 or elapsed > 75:
-            if len(self.caps) >= 40:
+        elif (key == 32 and turns >= 1.0) or turns >= TURNS_NEEDED * 0.985 or ncap >= 300 or elapsed > 75:
+            if ncap >= 40:
+                self._finish_raw()
                 self._start_process()
             else:
+                self._finish_raw(dict(result="too few frames"))
                 self.state = "NAME"
                 self.toast("That didn't capture enough - please try again", 5)
         if rgb is None:
@@ -309,7 +327,7 @@ class Booth:
         text_c(c, f"Turn {min(turns, TURNS_NEEDED):.1f} of {TURNS_NEEDED:.0f}", y - 22, 0.8, shadow=False)
         if not self.visible:
             text_c(c, "I can't see you - stay in the frame!", 130, 0.9, (80, 80, 255))
-        elif self.trk.quality < 0.6:
+        elif self.cap.trk.quality < 0.6:
             text_c(c, "Tracking slipping - turn a bit slower", 130, 0.9, (80, 180, 255))
         return c
 
@@ -406,6 +424,9 @@ def main():
         cv2.imshow(win, booth.tick(k))
     src.stop()
     cv2.destroyAllWindows()
+    cv2.waitKey(1)
+    sys.stdout.flush()
+    os._exit(0)  # skip Qt's atexit teardown, which segfaults with the fcitx5 input plugin
 
 
 if __name__ == "__main__":

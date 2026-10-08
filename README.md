@@ -55,7 +55,8 @@ Tips for good scans: stand about 3 m from the sensor with the whole body (feet t
 in view, arms slightly away from the body (A-pose), turn slowly (about 10 s per turn), wear
 non-reflective clothing, and keep other people out of the area behind you.
 
-Each scan is saved in `scans/<name>_<time>/`: `model.ply` / `model.obj` (vertex colours,
+Each scan is saved in `scans/<name>_<time>/` (with every raw frame in `raw/`, so
+`python3 rescan.py scans/<name>_<time>` can rebuild and debug it without spinning again): `model.ply` / `model.obj` (vertex colours,
 floor at y=0, y up; opens directly in Blender), `meta.json` (height, joint positions) and
 `preview.png`. In the viewer, `s` exports the current pose as PLY + OBJ + PNG.
 

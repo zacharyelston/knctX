@@ -23,6 +23,8 @@ In the 3d view: drag with the mouse to orbit, scroll to zoom.
 Replay a recording with:  kinect_overlay.py --play recordings/<timestamp>
 """
 import argparse
+import os
+import sys
 import json
 import queue
 import threading
@@ -516,6 +518,9 @@ def main():
         print("recording saved:", *rec.stop())
     kin.stop()
     cv2.destroyAllWindows()
+    cv2.waitKey(1)
+    sys.stdout.flush()
+    os._exit(0)  # skip Qt's atexit teardown, which segfaults with the fcitx5 input plugin
 
 
 if __name__ == "__main__":
