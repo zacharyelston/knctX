@@ -159,6 +159,29 @@ impl Segmenter {
                 }
             }
         }
+        // Win back thin features (hands, fingers) that the depth-edge cut and erosion removed:
+        // grow into gated pixels whose depth continues smoothly from an already-kept neighbour.
+        for _ in 0..3 {
+            let mut add = Vec::new();
+            for v in 1..H - 1 {
+                for u in 1..W - 1 {
+                    let i = v * W + u;
+                    if keep[i] || !m[i] {
+                        continue;
+                    }
+                    let d = depth[i] as i32;
+                    for j in [i - 1, i + 1, i - W, i + W] {
+                        if keep[j] && (depth[j] as i32 - d).abs() <= 30 {
+                            add.push(i);
+                            break;
+                        }
+                    }
+                }
+            }
+            for i in add {
+                keep[i] = true;
+            }
+        }
         let total = keep.iter().filter(|b| **b).count();
         if total > 500 {
             let (mut sx, mut sz, mut n, mut idx) = (0.0f32, 0.0f32, 0usize, 0usize);

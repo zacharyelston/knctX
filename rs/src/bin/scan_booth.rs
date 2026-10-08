@@ -560,12 +560,12 @@ impl Booth {
                 _ => {}
             }
         }
-        let t = (self.now() - self.t_view) as f32;
+        let t = (self.now() - self.t_view) as f32 * 0.4; // one animation cycle = 2.5 s
         let fig = self.fig.as_ref().unwrap();
         let target = fig.pose_params(POSES[self.pose_i], t);
         for j in 0..16 {
             for k in 0..3 {
-                self.cur[j][k] += (target[j][k] - self.cur[j][k]) * 0.3; // ease toward the target pose
+                self.cur[j][k] += (target[j][k] - self.cur[j][k]) * 0.08; // ease toward the target pose
             }
         }
         if self.auto {

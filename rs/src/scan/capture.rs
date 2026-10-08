@@ -107,13 +107,31 @@ impl RawSaver {
     }
 }
 
+/// Pixels with valid depth at least `r` pixels away from any invalid pixel (separable erosion).
+fn interior(depth: &[u16], r: usize) -> Vec<bool> {
+    let mut h = vec![false; W * H];
+    for y in 0..H {
+        for x in 0..W {
+            h[y * W + x] = x >= r && x + r < W && (x - r..=x + r).all(|k| depth[y * W + k] > 0);
+        }
+    }
+    let mut out = vec![false; W * H];
+    for y in r..H.saturating_sub(r) {
+        for x in 0..W {
+            out[y * W + x] = (y - r..=y + r).all(|k| h[k * W + x]);
+        }
+    }
+    out
+}
+
 pub fn build_model(caps: &[Cap], world: &World, center: [f32; 2], progress: &dyn Fn(&str, f32), log: &mut dyn FnMut(String)) -> Result<Mesh, String> {
     let pts: Vec<&[V3]> = caps.iter().map(|c| c.pts.as_slice()).collect();
     let poses: Vec<Pose> = caps.iter().map(|c| c.pose).collect();
     let poses = close_loops(&pts, &poses, log);
     let step = ((caps.len() as f32 / 110.0).ceil() as usize).max(1);
     let use_idx: Vec<usize> = (0..caps.len()).step_by(step).collect();
-    let frames: Vec<FrameRef> = use_idx.iter().map(|&i| FrameRef { depth: &caps[i].depth, rgb: &caps[i].rgb }).collect();
+    let col_ok: Vec<Vec<bool>> = use_idx.iter().map(|&i| interior(&caps[i].depth, 3)).collect();
+    let frames: Vec<FrameRef> = use_idx.iter().zip(&col_ok).map(|(&i, ok)| FrameRef { depth: &caps[i].depth, col_ok: ok, rgb: &caps[i].rgb }).collect();
     let up: Vec<Pose> = use_idx.iter().map(|&i| poses[i]).collect();
     let vol = fuse(&frames, &up, world, center, &|k, n| progress("Fusing depth", 0.1 + 0.7 * k as f32 / n as f32));
     progress("Building mesh", 0.85);

@@ -214,7 +214,7 @@ fn nearest_colour(vol: &Volume, p: V3) -> [u8; 3] {
                         continue;
                     }
                     let id = at(i, j, k);
-                    if vol.wt[id] >= 1.0 {
+                    if vol.cwt[id] >= 1.0 {
                         let d2 = di * di + dj * dj + dk * dk;
                         if best.map_or(true, |b| d2 < b.0) {
                             best = Some((d2, id));

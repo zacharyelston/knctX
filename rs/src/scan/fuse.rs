@@ -9,6 +9,8 @@ pub struct Volume {
     pub tsdf: Vec<f32>,
     pub wt: Vec<f32>,
     pub col: Vec<[f32; 3]>,
+    /// Colour sample count per voxel (separate from depth weight: edge pixels give depth only).
+    pub cwt: Vec<f32>,
     pub dims: [usize; 3],
     pub origin: V3,
     pub voxel: f32,
@@ -16,6 +18,8 @@ pub struct Volume {
 
 pub struct FrameRef<'a> {
     pub depth: &'a [u16],
+    /// Pixels far enough from the silhouette edge to trust their colour (edges bleed background).
+    pub col_ok: &'a [bool],
     pub rgb: &'a [u8],
 }
 
@@ -25,7 +29,7 @@ pub fn fuse(frames: &[FrameRef], poses: &[Pose], world: &World, center: [f32; 2]
     let dims = [n_of(2.0 * radius), n_of(height), n_of(2.0 * radius)];
     let origin = [center[0] - radius + voxel / 2.0, voxel / 2.0, center[1] - radius + voxel / 2.0];
     let n = dims[0] * dims[1] * dims[2];
-    let mut vol = Volume { tsdf: vec![1.0; n], wt: vec![0.0; n], col: vec![[0.0; 3]; n], dims, origin, voxel };
+    let mut vol = Volume { tsdf: vec![1.0; n], wt: vec![0.0; n], col: vec![[0.0; 3]; n], cwt: vec![0.0; n], dims, origin, voxel };
     let slab = dims[1] * dims[2];
     for (k, f) in frames.iter().enumerate() {
         let [phi, tx, tz] = poses[k];
@@ -36,8 +40,9 @@ pub fn fuse(frames: &[FrameRef], poses: &[Pose], world: &World, center: [f32; 2]
             .par_chunks_mut(slab)
             .zip(vol.wt.par_chunks_mut(slab))
             .zip(vol.col.par_chunks_mut(slab))
+            .zip(vol.cwt.par_chunks_mut(slab))
             .enumerate()
-            .for_each(|(i, ((ts, ws), cs))| {
+            .for_each(|(i, (((ts, ws), cs), cw))| {
                 let vx = origin[0] + i as f32 * voxel;
                 for j in 0..ny {
                     let vy = origin[1] + j as f32 * voxel;
@@ -67,8 +72,12 @@ pub fn fuse(frames: &[FrameRef], poses: &[Pose], world: &World, center: [f32; 2]
                         let id = j * nz + kk;
                         let w0 = ws[id];
                         ts[id] = (ts[id] * w0 + sv) / (w0 + 1.0);
-                        for ch in 0..3 {
-                            cs[id][ch] = (cs[id][ch] * w0 + f.rgb[px * 3 + ch] as f32) / (w0 + 1.0);
+                        if f.col_ok[px] {
+                            let c0 = cw[id];
+                            for ch in 0..3 {
+                                cs[id][ch] = (cs[id][ch] * c0 + f.rgb[px * 3 + ch] as f32) / (c0 + 1.0);
+                            }
+                            cw[id] = c0 + 1.0;
                         }
                         ws[id] = w0 + 1.0;
                     }
