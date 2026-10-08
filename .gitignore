@@ -3,3 +3,4 @@ snapshots/
 pointclouds/
 recordings/
 scans/
+rs/target/

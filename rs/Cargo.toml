@@ -1,0 +1,17 @@
+[package]
+name = "kinect3d"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+minifb = "0.29.0"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+rayon = "1"
+serde_json = "1"
+fontdue = "0.9.4"
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = "thin"
+codegen-units = 4

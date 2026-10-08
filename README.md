@@ -38,6 +38,25 @@ python3 kinect_overlay.py
 The Kinect's streams sometimes fail to start on USB 2 hubs (`Invalid magic` /
 `Lost too many packets` messages). The app detects a stalled stream and restarts the device.
 
+## Rust version (recommended)
+
+The whole thing is also ported to Rust in `rs/` - same behaviour, a fraction of the CPU
+(the Python booth idles at ~9 cores on the name screen, the Rust one at a quarter of one core,
+and a rescan that took 40 s takes 7 s).
+
+```
+cd rs
+cargo build --release
+./target/release/scan_booth               # real Kinect (or --demo, --view DIR, --autorun NAME)
+./target/release/rescan ../scans/<folder> # rebuild a saved scan (--refloor, --out DIR)
+./target/release/kinect_overlay           # RGB + depth viewer (or --play ../recordings/<ts>)
+./target/release/selftest                 # headless end-to-end check on the synthetic person
+```
+
+Needs only `libfreenect` (linked directly via FFI) - no OpenCV or Python. Notes: F11 fullscreen
+is not available (resize the window instead); the mesher is surface-nets rather than marching
+cubes, so vertex counts differ slightly from the Python models.
+
 ## 3D body-scan booth
 
 ```
