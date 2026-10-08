@@ -124,10 +124,10 @@ pub fn fit_floor(depth: &[u16], seed: u64) -> Option<World> {
 /// Distance (m) to the nearest sizeable object in the middle of the view, or None.
 pub fn nearest_distance(depth: &[u16]) -> Option<f32> {
     let mut v: Vec<f32> = Vec::new();
-    for r in 0..H {
+    for r in 0..380 {
         for c in 120..520 {
             let d = depth[r * W + c];
-            if d > 500 {
+            if d > 1000 {
                 v.push(d as f32);
             }
         }
@@ -137,7 +137,7 @@ pub fn nearest_distance(depth: &[u16]) -> Option<f32> {
     }
     let z0 = percentile(&mut v.clone(), 8.0);
     let mut blob: Vec<f32> = Vec::new();
-    for r in 0..H {
+    for r in 0..380 {
         for c in 120..520 {
             let d = depth[r * W + c];
             if d > 0 && (d as f32 - z0).abs() < 250.0 {

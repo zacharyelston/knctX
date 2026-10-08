@@ -55,7 +55,8 @@ fn framing(depth: &[u16], dist: f32) -> (bool, bool) {
     }
     let (mut feet, mut head) = (false, false);
     for c in cmin..=cmax {
-        if (H - 4..H).any(|r| band(r, c)) && (300..476).filter(|&r| band(r, c)).count() as f32 / 176.0 > 0.7 {
+        let (z_mid, z_bot) = (depth[300 * W + c] as i32, depth[(H - 2) * W + c] as i32);
+        if (H - 4..H).any(|r| band(r, c)) && z_mid > 0 && z_bot > 0 && (z_mid - z_bot).abs() < 120 && (300..476).filter(|&r| band(r, c)).count() as f32 / 176.0 > 0.7 {
             feet = true;
         }
         if (0..4).any(|r| band(r, c)) && (5..200).filter(|&r| band(r, c)).count() as f32 / 195.0 > 0.7 {
@@ -190,10 +191,10 @@ impl Booth {
         }
         // auto-framing: nudge the sensor tilt (rate limited: the motor dislikes rapid moves)
         if let (true, Some(d)) = (self.autotilt, dist) {
-            if d > 2.2 && d < 4.6 && now - self.probe.tilt_t > 2.5 {
+            if d > 2.2 && d < 4.6 && now - self.probe.tilt_t > 2.5 && !self.world.floor_found {
                 let step = if feet_cut && !head_cut { -4 } else if head_cut && !feet_cut { 4 } else { 0 };
                 let cur = self.src.tilt_target();
-                let new = (cur + step).clamp(-27, 27);
+                let new = (cur + step).clamp(-15, 10);
                 if step != 0 && new != cur {
                     self.src.set_tilt(new);
                     self.probe.tilt_t = now;
