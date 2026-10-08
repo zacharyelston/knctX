@@ -21,11 +21,16 @@ pub struct Profile {
     pub track_pts: usize,
     /// Tracking points are limited to this world-height band (None = the segmenter's own gate).
     pub track_y: Option<(f32, f32)>,
+    /// Track only the top this-many metres of the gated height (head and shoulders: hands and
+    /// lap move independently of the spin and would pull the alignment off).
+    pub track_top: Option<f32>,
     pub icp_max_d: f32,
     pub icp_rms: f64,
     /// Rotation between tracking keyframes (degrees).
     pub key_deg: f64,
     pub loops: LoopCfg,
+    /// Passes of re-aligning every frame against all the others after loop closure.
+    pub refine_passes: usize,
     pub voxel: f32,
     pub trunc: f32,
     pub radius: f32,
@@ -36,12 +41,12 @@ pub struct Profile {
 
 impl Profile {
     pub fn body() -> Profile {
-        Profile { name: "body", min_mask_px: 3000, min_pts: 1500, track_pts: 3000, track_y: Some((0.15, 1.9)), icp_max_d: 0.10, icp_rms: 0.04, key_deg: 12.0,
-                  loops: LoopCfg { max_d: 0.12, rms: 0.04, shift: 0.25 }, voxel: 0.015, trunc: 0.06, radius: 0.95, max_frames: 110, min_extent: 0.3, smooth: 8 }
+        Profile { name: "body", min_mask_px: 3000, min_pts: 1500, track_pts: 3000, track_y: Some((0.15, 1.9)), track_top: None, icp_max_d: 0.10, icp_rms: 0.04, key_deg: 12.0,
+                  loops: LoopCfg { max_d: 0.12, rms: 0.04, shift: 0.25 }, refine_passes: 0, voxel: 0.015, trunc: 0.06, radius: 0.95, max_frames: 110, min_extent: 0.3, smooth: 8 }
     }
     pub fn bust() -> Profile {
-        Profile { name: "bust", min_mask_px: 6000, min_pts: 3000, track_pts: 6000, track_y: None, icp_max_d: 0.08, icp_rms: 0.025, key_deg: 6.0,
-                  loops: LoopCfg { max_d: 0.06, rms: 0.025, shift: 0.12 }, voxel: 0.006, trunc: 0.025, radius: 0.40, max_frames: 150, min_extent: 0.25, smooth: 4 }
+        Profile { name: "bust", min_mask_px: 6000, min_pts: 3000, track_pts: 6000, track_y: None, track_top: None, icp_max_d: 0.08, icp_rms: 0.025, key_deg: 6.0,
+                  loops: LoopCfg { max_d: 0.06, rms: 0.025, shift: 0.12 }, refine_passes: 0, voxel: 0.006, trunc: 0.025, radius: 0.40, max_frames: 150, min_extent: 0.25, smooth: 4 }
     }
     pub fn by_name(n: &str) -> Profile { if n == "bust" { Profile::bust() } else { Profile::body() } }
 }
@@ -76,7 +81,10 @@ impl Capture {
             return (m, false);
         }
         // no floor / overhead: static points bias the spin tracker
-        let (ylo, yhi) = self.profile.track_y.unwrap_or((f32::NEG_INFINITY, f32::INFINITY));
+        let (mut ylo, yhi) = self.profile.track_y.unwrap_or((f32::NEG_INFINITY, f32::INFINITY));
+        if let Some(h) = self.profile.track_top {
+            ylo = ylo.max(self.seg.y_hi - h);
+        }
         let p: Vec<V3> = (0..W * H).filter(|&i| m[i] && pw[i][1] > ylo && pw[i][1] < yhi).map(|i| pw[i]).collect();
         if p.len() < self.profile.min_pts {
             return (m, false);
@@ -167,6 +175,7 @@ pub fn build_model(caps: &[Cap], world: &World, center: [f32; 2], prof: &Profile
     let pts: Vec<&[V3]> = caps.iter().map(|c| c.pts.as_slice()).collect();
     let poses: Vec<Pose> = caps.iter().map(|c| c.pose).collect();
     let poses = close_loops(&pts, &poses, prof.loops, log);
+    let poses = if prof.refine_passes > 0 { refine_poses(&pts, &poses, prof.loops.max_d, prof.refine_passes, log) } else { poses };
     let step = ((caps.len() as f32 / prof.max_frames as f32).ceil() as usize).max(1);
     let use_idx: Vec<usize> = (0..caps.len()).step_by(step).collect();
     let col_ok: Vec<Vec<bool>> = use_idx.iter().map(|&i| interior(&caps[i].depth, 3)).collect();
@@ -198,6 +207,16 @@ pub fn rescan(folder: &Path, out: Option<&Path>, log: &mut dyn FnMut(String), re
         t: [0, 1, 2].map(|i| f(&cfg["world_t"][i])),
         floor_found: cfg["floor_found"].as_bool().unwrap_or(false),
     };
+    // debug aid: KINECT_TILT=pitch,roll degrees rotates the assumed gravity direction
+    if let Some((pd, rd)) = std::env::var("KINECT_TILT").ok().and_then(|v| { let (a, b) = v.split_once(',')?; Some((a.parse::<f32>().ok()?, b.parse::<f32>().ok()?)) }) {
+        let u = world.r[1];
+        let (cp, sp, cr, sr) = (pd.to_radians().cos(), pd.to_radians().sin(), rd.to_radians().cos(), rd.to_radians().sin());
+        let u1 = [u[0], cp * u[1] - sp * u[2], sp * u[1] + cp * u[2]]; // pitch about camera x
+        let u2 = [cr * u1[0] - sr * u1[1], sr * u1[0] + cr * u1[1], u1[2]]; // roll about camera z
+        let ex: V3 = [1.0, 0.0, 0.0];
+        let xw = normalize(sub(ex, scale(u2, dot(ex, u2))));
+        world.r = [xw, u2, cross(xw, u2)];
+    }
     if refloor {
         match fit_floor(&d0, 0) {
             Some(w) => {
@@ -211,19 +230,25 @@ pub fn rescan(folder: &Path, out: Option<&Path>, log: &mut dyn FnMut(String), re
     let mut seg = Segmenter::new(world);
     let mut y_range = (0.0f32, 2.1f32);
     if prof.name == "bust" {
-        let (lo, hi) = (f(&cfg["y_lo"]), f(&cfg["y_hi"]));
-        seg.y_lo = lo;
-        seg.y_hi = hi;
         seg.bust_defaults();
-        y_range = (lo, hi);
-    }
-    if let (Some(c), false) = (cfg["center"].as_array(), refloor) {
+        if refloor || std::env::var("KINECT_TILT").is_ok() {
+            // new gravity from the floor: re-derive the subject's centre and height gate
+            seg.find_bust(&d0, 0.62).ok_or("no subject found in the first raw frame")?;
+        } else {
+            seg.y_lo = f(&cfg["y_lo"]);
+            seg.y_hi = f(&cfg["y_hi"]);
+            seg.center = Some([f(&cfg["center"][0]), f(&cfg["center"][1])]);
+        }
+        y_range = (seg.y_lo, seg.y_hi);
+    } else if let (Some(c), false) = (cfg["center"].as_array(), refloor) {
         seg.center = Some([f(&c[0]), f(&c[1])]);
-    } else if prof.name == "body" && seg.find_person(&d0).is_none() {
+    } else if seg.find_person(&d0).is_none() {
         return Err("no person found in the first raw frame".into());
     }
     let mut cap = Capture::with(seg, prof);
-    for i in 0..n {
+    // debug aid: KINECT_FRAMES=a-b restricts the rebuild to a frame range
+    let (fa, fb) = std::env::var("KINECT_FRAMES").ok().and_then(|v| { let (a, b) = v.split_once('-')?; Some((a.parse().ok()?, b.parse().ok()?)) }).unwrap_or((0usize, n));
+    for i in fa..fb.min(n) {
         if let Some((rgb, depth)) = load(i) {
             cap.add(&std::sync::Arc::new(rgb), &depth);
         }

@@ -152,6 +152,9 @@ pub fn nearest_distance(depth: &[u16]) -> Option<f32> {
     }
 }
 
+/// Pitch correction (degrees, about the camera x axis) applied to the accelerometer's gravity.
+pub const ACCEL_PITCH_BIAS_DEG: f32 = -3.5;
+
 /// World frame from a gravity reading (the sensor's accelerometer): y up, camera 1 m above the
 /// origin. Use when the floor isn't visible (close-up seated scans). `accel` is the raw reading in
 /// sensor axes. Returns None if it is implausible.
@@ -164,6 +167,11 @@ pub fn world_from_accel(accel: [f64; 3]) -> Option<World> {
         return None;
     }
     let u = scale(a, 1.0 / m); // up, in camera axes (x right, y down, z forward)
+    // This sensor's accelerometer reads ~3.5 deg off in pitch (found by sweeping the assumed
+    // gravity on a real bust scan: head width and loop-closure drift are best there, and it
+    // matches the offset against floor fits). Override with KINECT_ACCEL_PITCH=<deg>.
+    let bias = std::env::var("KINECT_ACCEL_PITCH").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(ACCEL_PITCH_BIAS_DEG).to_radians();
+    let u = [u[0], bias.cos() * u[1] - bias.sin() * u[2], bias.sin() * u[1] + bias.cos() * u[2]];
     let ex: V3 = [1.0, 0.0, 0.0];
     let xw = normalize(sub(ex, scale(u, dot(ex, u))));
     let zw = cross(xw, u);

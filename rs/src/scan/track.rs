@@ -39,6 +39,8 @@ pub struct Grid {
     dims: [usize; 3],
     start: Vec<u32>,
     items: Vec<u32>,
+    /// Optional owner (frame index) of each point, for excluding a frame's own points.
+    ids: Vec<u16>,
 }
 
 impl Grid {
@@ -72,11 +74,19 @@ impl Grid {
             items[fill[c] as usize] = i as u32;
             fill[c] += 1;
         }
-        Grid { pts: pts.to_vec(), origin, cell, dims, start, items }
+        Grid { pts: pts.to_vec(), origin, cell, dims, start, items, ids: Vec::new() }
+    }
+
+    pub fn with_ids(mut self, ids: Vec<u16>) -> Grid {
+        self.ids = ids;
+        self
     }
 
     /// Nearest stored point within `max_d` of `q`: (index, distance).
-    pub fn nearest(&self, q: V3, max_d: f32) -> Option<(usize, f32)> {
+    pub fn nearest(&self, q: V3, max_d: f32) -> Option<(usize, f32)> { self.nearest_excl(q, max_d, (1, 0)) }
+
+    /// Like `nearest`, skipping points whose owner id lies in the inclusive range `excl` (lo > hi = none).
+    pub fn nearest_excl(&self, q: V3, max_d: f32, excl: (u16, u16)) -> Option<(usize, f32)> {
         let lo = [0, 1, 2].map(|k| ((q[k] - max_d - self.origin[k]) / self.cell).floor() as i64);
         let hi = [0, 1, 2].map(|k| ((q[k] + max_d - self.origin[k]) / self.cell).floor() as i64);
         let mut best: Option<(usize, f32)> = None;
@@ -86,6 +96,9 @@ impl Grid {
                 for z in lo[2].max(0)..=hi[2].min(self.dims[2] as i64 - 1) {
                     let id = (x as usize * self.dims[1] + y as usize) * self.dims[2] + z as usize;
                     for &it in &self.items[self.start[id] as usize..self.start[id + 1] as usize] {
+                        if !self.ids.is_empty() && self.ids[it as usize] >= excl.0 && self.ids[it as usize] <= excl.1 {
+                            continue;
+                        }
                         let p = self.pts[it as usize];
                         let d2 = (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2);
                         if d2 < best2 {
@@ -101,7 +114,9 @@ impl Grid {
 }
 
 /// Align `src` to `tgt` with a yaw rotation + floor translation. Returns (pose, rms, inlier_frac).
-pub fn icp_yaw(src: &[V3], tgt: &[V3], grid: &Grid, init: Pose, iters: usize, max_d: f32) -> (Pose, f64, f64) {
+pub fn icp_yaw(src: &[V3], tgt: &[V3], grid: &Grid, init: Pose, iters: usize, max_d: f32) -> (Pose, f64, f64) { icp_yaw_ex(src, tgt, grid, init, iters, max_d, (1, 0)) }
+
+pub fn icp_yaw_ex(src: &[V3], tgt: &[V3], grid: &Grid, init: Pose, iters: usize, max_d: f32, excl: (u16, u16)) -> (Pose, f64, f64) {
     let mut pose = init;
     let mut last_rms = 1.0;
     let mut last_frac = 0.0;
@@ -110,7 +125,7 @@ pub fn icp_yaw(src: &[V3], tgt: &[V3], grid: &Grid, init: Pose, iters: usize, ma
         let mut pairs: Vec<(usize, usize, f32)> = src
             .par_iter()
             .enumerate()
-            .filter_map(|(i, s)| grid.nearest(pose_apply_pt(&pose, *s), max_d).map(|(j, d)| (i, j, d)))
+            .filter_map(|(i, s)| grid.nearest_excl(pose_apply_pt(&pose, *s), max_d, excl).map(|(j, d)| (i, j, d)))
             .collect();
         if pairs.len() < 100 {
             return (pose, 1.0, 0.0);
@@ -290,4 +305,44 @@ pub fn close_loops(pts_list: &[&[V3]], poses: &[Pose], cfg: LoopCfg, log: &mut d
         out[k] = pose_compose(&e, &poses[k]);
     }
     out
+}
+
+/// Re-align every frame against a model pooled from all the other frames (excluding itself and its
+/// immediate neighbours), a few passes. Sharpens what a single loop correction leaves blurred.
+pub fn refine_poses(pts_list: &[&[V3]], poses: &[Pose], max_d: f32, passes: usize, log: &mut dyn FnMut(String)) -> Vec<Pose> {
+    let n = poses.len();
+    let mut cur = poses.to_vec();
+    if n < 8 {
+        return cur;
+    }
+    for pass in 0..passes {
+        let (mut pool, mut ids) = (Vec::new(), Vec::new());
+        for (k, pts) in pts_list.iter().enumerate() {
+            for p in pts.iter().step_by(3) {
+                pool.push(pose_apply_pt(&cur[k], *p));
+                ids.push(k as u16);
+            }
+        }
+        let grid = Grid::new(&pool, max_d.max(0.03)).with_ids(ids);
+        let mut moved = 0.0f64;
+        let next: Vec<Pose> = (0..n)
+            .map(|k| {
+                let ex = (k.saturating_sub(4) as u16, (k + 4).min(n - 1) as u16);
+                let (p, rms, frac) = icp_yaw_ex(pts_list[k], &pool, &grid, cur[k], 12, max_d, ex);
+                // accept only sane, well-supported refinements
+                let dphi = wrap_pi(p[0] - cur[k][0]);
+                if rms < 0.03 && frac > 0.4 && dphi.abs() < 6f64.to_radians() {
+                    p
+                } else {
+                    cur[k]
+                }
+            })
+            .collect();
+        for k in 0..n {
+            moved += wrap_pi(next[k][0] - cur[k][0]).abs();
+        }
+        log(format!("refine pass {}: mean change {:.2} deg", pass + 1, (moved / n as f64).to_degrees()));
+        cur = next;
+    }
+    cur
 }

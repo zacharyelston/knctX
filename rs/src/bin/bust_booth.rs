@@ -401,7 +401,7 @@ impl Booth {
         c.text_c(&format!("{}{}", if self.probe.ok { "OK  " } else { "..  " }, self.probe.text), CH as i32 - 224, 0.75, col, true);
         self.distance_meter(&mut c, CH as i32 - 168);
         c.text_c("Sit on the swivel chair about 1.1 m from the sensor, arms relaxed", CH as i32 - 106, 0.6, GRAY_T, false);
-        c.text_c("After 3-2-1, turn the chair slowly all the way round (about 15 s)", CH as i32 - 80, 0.6, GRAY_T, false);
+        c.text_c("After 3-2-1, turn the chair slowly round - keep your HEAD STRAIGHT with your body, don't look at the camera", CH as i32 - 80, 0.6, GRAY_T, false);
         c.text_c(
             &format!("Tilt {:+} deg ({}, Tab toggles)  Up/Down arrows tilt   Esc quits", self.src.tilt_target(), if self.autotilt { "auto" } else { "manual" }),
             CH as i32 - 50, 0.5, bgr(150, 150, 150), false,
@@ -439,7 +439,7 @@ impl Booth {
         let (tw, th) = (text_width(&s, scale), (px_for(scale) * 0.72) as i32);
         c.text(&s, (CW as i32 - tw) / 2, (CH as i32 + th) / 2, scale, WHITE, true);
         c.text_c(&format!("Get ready, {}!", self.name), 120, 1.2, TOAST, true);
-        c.text_c("Then turn the chair slowly, one full turn", CH as i32 - 60, 0.8, WHITE, true);
+        c.text_c("Turn slowly, one full turn - head straight, eyes forward", CH as i32 - 60, 0.8, WHITE, true);
         c
     }
 
@@ -470,6 +470,7 @@ impl Booth {
         let Some(rgb) = rgb else { return c };
         c.camera(&rgb, self.last_mask.as_deref(), 0.15, true);
         c.text_c("TURN SLOWLY!", 70, 1.4, ACCENT, true);
+        c.text_c("head straight with your body - don't track the camera", 100, 0.6, GRAY_T, true);
         let (x0, x1, y) = (160, CW as i32 - 160, CH as i32 - 70);
         c.panel(x0 - 14, y - 52, x1 + 14, y + 24, 0.7);
         c.rect(x0, y - 12, x1, y + 6, bgr(70, 70, 70));
