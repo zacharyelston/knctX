@@ -1,5 +1,5 @@
 //! Capture (tracked, masked frames), raw saving, rescan from raw, and the full model build.
-use super::fuse::{fuse, hull_fill, FrameRef, FuseCfg};
+use super::fuse::{fuse, hull_fill, symmetrize_head, FrameRef, FuseCfg};
 use super::mesh::{extract_mesh, Mesh};
 use super::rig::Figure;
 use super::segment::Segmenter;
@@ -208,6 +208,10 @@ pub fn build_model(caps: &[Cap], world: &World, center: [f32; 2], prof: &Profile
     if prof.name == "bust" && std::env::var("KINECT_NO_HULL").is_err() {
         let n = hull_fill(&mut vol, &frames, &up, world, center, envf("KINECT_HULL_H", 0.6), envf("KINECT_HULL_REACH", 0.04), envf("KINECT_HULL_FRAC", 0.97));
         log(format!("hull fill: +{n} voxels"));
+        if std::env::var("KINECT_NO_SYM").is_err() {
+            let m = symmetrize_head(&mut vol, 0.26);
+            log(format!("head symmetry: +{m} voxels"));
+        }
     }
     progress("Building mesh", 0.85);
     extract_mesh(&vol, envf("KINECT_MINOBS", 2.0), envf("KINECT_SMOOTH", prof.smooth as f32) as _, prof.min_extent)

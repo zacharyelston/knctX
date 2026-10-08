@@ -228,3 +228,78 @@ pub fn hull_fill(vol: &mut Volume, frames: &[FrameRef], poses: &[Pose], world: &
     let _ = center;
     added
 }
+
+/// Make the head left-right symmetric: find its sagittal plane (the long axis of the head's
+/// footprint, through its centroid) and make every head voxel solid if its mirror image is.
+pub fn symmetrize_head(vol: &mut Volume, head_h: f32) -> usize {
+    let [nx, ny, nz] = vol.dims;
+    let slab = ny * nz;
+    let solid = |v: &Volume, id: usize| v.tsdf[id] < 0.0 && v.wt[id] >= 2.0;
+    let mut top = 0;
+    for j in 0..ny {
+        let n = (0..nx).map(|i| (0..nz).filter(|k| solid(vol, i * slab + j * nz + k)).count()).sum::<usize>();
+        if n >= 60 {
+            top = j;
+        }
+    }
+    let vox = vol.voxel;
+    let (jl, jh) = (top.saturating_sub((head_h / vox) as usize), top.saturating_sub((0.03 / vox) as usize));
+    // footprint of the head proper (skull band, below the hair tuft)
+    let (mut n, mut sx, mut sz) = (0.0f64, 0.0f64, 0.0f64);
+    let (jb0, jb1) = (top.saturating_sub((0.17 / vox) as usize), top.saturating_sub((0.05 / vox) as usize));
+    for i in 0..nx {
+        for j in jb0..=jb1 {
+            for k in 0..nz {
+                if solid(vol, i * slab + j * nz + k) {
+                    n += 1.0;
+                    sx += i as f64;
+                    sz += k as f64;
+                }
+            }
+        }
+    }
+    if n < 200.0 {
+        return 0;
+    }
+    let (cx, cz) = (sx / n, sz / n);
+    let (mut sxx, mut szz, mut sxz) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 0..nx {
+        for j in jb0..=jb1 {
+            for k in 0..nz {
+                if solid(vol, i * slab + j * nz + k) {
+                    let (a, b) = (i as f64 - cx, k as f64 - cz);
+                    sxx += a * a;
+                    szz += b * b;
+                    sxz += a * b;
+                }
+            }
+        }
+    }
+    // minor axis of the footprint = left-right direction
+    let ang = 0.5 * (2.0 * sxz).atan2(sxx - szz); // major axis angle
+    let (nxl, nzl) = (-ang.sin(), ang.cos()); // lateral unit normal (perpendicular to the major axis)
+    let mut add = Vec::new();
+    for i in 0..nx {
+        for j in jl..=jh {
+            for k in 0..nz {
+                let id = i * slab + j * nz + k;
+                if solid(vol, id) {
+                    let d = (i as f64 - cx) * nxl + (k as f64 - cz) * nzl;
+                    let (mi, mk) = ((i as f64 - 2.0 * d * nxl).round(), (k as f64 - 2.0 * d * nzl).round());
+                    if mi >= 0.0 && mk >= 0.0 && (mi as usize) < nx && (mk as usize) < nz {
+                        let mid = mi as usize * slab + j * nz + mk as usize;
+                        if !solid(vol, mid) {
+                            add.push(mid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let n_add = add.len();
+    for id in add {
+        vol.tsdf[id] = -0.3;
+        vol.wt[id] = vol.wt[id].max(2.5);
+    }
+    n_add
+}
