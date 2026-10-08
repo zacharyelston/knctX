@@ -59,7 +59,8 @@ fn framing(depth: &[u16], dist: f32) -> (bool, bool) {
         if (H - 4..H).any(|r| band(r, c)) && z_mid > 0 && z_bot > 0 && (z_mid - z_bot).abs() < 120 && (300..476).filter(|&r| band(r, c)).count() as f32 / 176.0 > 0.7 {
             feet = true;
         }
-        if (0..4).any(|r| band(r, c)) && (5..200).filter(|&r| band(r, c)).count() as f32 / 195.0 > 0.7 {
+        // the registered depth image is blank above row ~45, so look just below that band
+        if (46..52).any(|r| band(r, c)) && (52..200).filter(|&r| band(r, c)).count() as f32 / 148.0 > 0.7 {
             head = true;
         }
     }

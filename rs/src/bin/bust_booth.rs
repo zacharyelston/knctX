@@ -190,8 +190,9 @@ impl Booth {
         let dist = bust_distance(&depth);
         self.probe.dist = dist;
         let (top, area) = dist.map_or((H, 0), |d| subject_rows(&depth, d));
-        let head_cut = dist.is_some() && top < 6;
-        let head_low = dist.is_some() && top > 150;
+        // registered depth is blank above row ~45, so a subject starting there is cut off by the sensor
+        let head_cut = dist.is_some() && top < 60;
+        let head_low = dist.is_some() && top > 170;
         if let (true, Some(_)) = (self.autotilt, dist) {
             if (head_cut || head_low) && now - self.probe.tilt_t > 1.5 {
                 let cur = self.src.tilt_target();
@@ -207,7 +208,7 @@ impl Booth {
         let (text, ok) = match dist {
             None => ("Nothing in view - sit down in front of the sensor".to_string(), false),
             Some(d) if d < 0.8 => (format!("{d:.2} m - too close, move back to about 1.1 m"), false),
-            Some(d) if d > 1.5 => (format!("{d:.2} m - too far, move closer (about 1.1 m)"), false),
+            Some(d) if d > 1.35 => (format!("{d:.2} m - too far, move closer (about 1.1 m)"), false),
             Some(d) if head_cut => (format!("{d:.2} m - head cut off: tilting sensor up{auto}, or sit lower"), false),
             Some(d) if head_low => (format!("{d:.2} m - too much empty space above you: tilting down{auto}"), false),
             Some(d) if res.is_none() || area < 25000 => (format!("{d:.2} m - good distance, but I can't see head and shoulders yet"), false),

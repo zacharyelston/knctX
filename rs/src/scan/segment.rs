@@ -10,10 +10,13 @@ pub struct Segmenter {
     /// Height gate (world y, metres) applied by `mask`.
     pub y_lo: f32,
     pub y_hi: f32,
+    /// Smallest detached piece (as a fraction of the main blob) that is still kept, e.g. a head.
+    pub min_comp_frac: f32,
+    pub max_extra: usize,
 }
 
 impl Segmenter {
-    pub fn new(world: World) -> Self { Segmenter { world, center: None, radius: 0.95, y_lo: 0.08, y_hi: 2.3 } }
+    pub fn new(world: World) -> Self { Segmenter { world, center: None, radius: 0.95, y_lo: 0.08, y_hi: 2.3, min_comp_frac: 0.03, max_extra: 5 } }
 
     /// Return (center_xz, height_m) of the nearest large upright object, or None.
     pub fn find_person(&mut self, depth: &[u16]) -> Option<([f32; 2], f32)> {
@@ -58,6 +61,13 @@ impl Segmenter {
         None
     }
 
+    /// Settings for seated close-ups: small detached pieces (the head behind a depth step) matter.
+    pub fn bust_defaults(&mut self) {
+        self.radius = 0.45;
+        self.min_comp_frac = 0.002;
+        self.max_extra = 12;
+    }
+
     /// Seated close-up: find the nearest large blob 0.5-1.9 m away. Sets the centre, a 0.45 m
     /// radius and a height gate covering the top `bust_h` metres of the subject (head down to
     /// mid-chest). Returns (centre_xz, top_y).
@@ -95,7 +105,7 @@ impl Segmenter {
                 }
                 let top = percentile(&mut ys, 99.5);
                 self.center = Some(c);
-                self.radius = 0.45;
+                self.bust_defaults();
                 self.y_hi = top + 0.05;
                 self.y_lo = top - bust_h;
                 return Some((c, top));
@@ -184,8 +194,8 @@ impl Segmenter {
                 }
             }
             let cb = [sx / cnt.max(1) as f32, sz / cnt.max(1) as f32];
-            for &ci in order.iter().skip(1).take(5) {
-                if (areas[ci] as f32) < 0.03 * areas[big] as f32 {
+            for &ci in order.iter().skip(1).take(self.max_extra) {
+                if (areas[ci] as f32) < self.min_comp_frac * areas[big] as f32 {
                     break;
                 }
                 let (mut ax, mut az, mut n, mut idx) = (0.0f32, 0.0f32, 0usize, 0usize);

@@ -30,19 +30,35 @@ fn main() {
     let t = Instant::now();
     match rescan(Path::new(&folder), out.as_deref().map(Path::new), &mut |s| println!("{s}"), refloor) {
         Ok((out, _stats, mesh)) => {
-            let fig = Figure::new(mesh.verts.clone(), mesh.faces.clone(), mesh.rgb.clone());
+            let bust = std::fs::read_to_string(Path::new(&folder).join("raw/capture.json")).map_or(false, |t| t.contains("\"profile\":\"bust\""));
+            let fig = if bust { None } else { Some(Figure::new(mesh.verts.clone(), mesh.faces.clone(), mesh.rgb.clone())) };
             let mut sheet = Canvas::new(4 * 480, 540);
             for (n, yaw) in [0.3f32, 0.3 + 1.57, 0.3 + 3.14, 0.3 + 4.71].iter().enumerate() {
                 let mut c = Canvas::new(480, 540);
                 let mut o = Orbit3D::new();
                 o.yaw = *yaw;
-                render_mesh(&mut c, &fig.rest, &fig.rest_normals, &fig.faces, &fig.rgb, &o, fig.top);
+                match &fig {
+                    Some(f) => render_mesh(&mut c, &f.rest, &f.rest_normals, &f.faces, &f.rgb, &o, f.top),
+                    None => {
+                        let nrm = kinect3d::scan::mesh::vertex_normals(&mesh.verts, &mesh.faces);
+                        let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+                        for v in &mesh.verts {
+                            for k in 0..3 {
+                                lo[k] = lo[k].min(v[k]);
+                                hi[k] = hi[k].max(v[k]);
+                            }
+                        }
+                        let focus = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0];
+                        let ext = (hi[1] - lo[1]).max(hi[0] - lo[0]);
+                        render_mesh_at(&mut c, &mesh.verts, &nrm, &mesh.faces, &mesh.rgb, &o, focus, 1.5 * ext, false)
+                    }
+                }
                 for y in 0..540 {
                     sheet.buf[y * sheet.w + n * 480..y * sheet.w + n * 480 + 480].copy_from_slice(&c.buf[y * 480..(y + 1) * 480]);
                 }
             }
             kinect3d::io::save_rgb_png(&out.join("preview.png"), &sheet.buf, sheet.w, sheet.h);
-            println!("model: {} verts, {} faces, {:.2} m tall -> {} ({:?})", mesh.verts.len(), mesh.faces.len(), fig.top, out.display(), t.elapsed());
+            println!("model: {} verts, {} faces, {:.2} m tall -> {} ({:?})", mesh.verts.len(), mesh.faces.len(), fig.as_ref().map_or(0.0, |f| f.top), out.display(), t.elapsed());
         }
         Err(e) => {
             eprintln!("rescan failed: {e}");

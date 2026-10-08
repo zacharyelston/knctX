@@ -23,6 +23,8 @@ pub struct Profile {
     pub track_y: Option<(f32, f32)>,
     pub icp_max_d: f32,
     pub icp_rms: f64,
+    /// Rotation between tracking keyframes (degrees).
+    pub key_deg: f64,
     pub loops: LoopCfg,
     pub voxel: f32,
     pub trunc: f32,
@@ -34,12 +36,12 @@ pub struct Profile {
 
 impl Profile {
     pub fn body() -> Profile {
-        Profile { name: "body", min_mask_px: 3000, min_pts: 1500, track_pts: 3000, track_y: Some((0.15, 1.9)), icp_max_d: 0.10, icp_rms: 0.04,
+        Profile { name: "body", min_mask_px: 3000, min_pts: 1500, track_pts: 3000, track_y: Some((0.15, 1.9)), icp_max_d: 0.10, icp_rms: 0.04, key_deg: 12.0,
                   loops: LoopCfg { max_d: 0.12, rms: 0.04, shift: 0.25 }, voxel: 0.015, trunc: 0.06, radius: 0.95, max_frames: 110, min_extent: 0.3, smooth: 8 }
     }
     pub fn bust() -> Profile {
-        Profile { name: "bust", min_mask_px: 6000, min_pts: 3000, track_pts: 6000, track_y: None, icp_max_d: 0.05, icp_rms: 0.02,
-                  loops: LoopCfg { max_d: 0.05, rms: 0.02, shift: 0.10 }, voxel: 0.006, trunc: 0.025, radius: 0.40, max_frames: 150, min_extent: 0.25, smooth: 4 }
+        Profile { name: "bust", min_mask_px: 6000, min_pts: 3000, track_pts: 6000, track_y: None, icp_max_d: 0.08, icp_rms: 0.025, key_deg: 6.0,
+                  loops: LoopCfg { max_d: 0.06, rms: 0.025, shift: 0.12 }, voxel: 0.006, trunc: 0.025, radius: 0.40, max_frames: 150, min_extent: 0.25, smooth: 4 }
     }
     pub fn by_name(n: &str) -> Profile { if n == "bust" { Profile::bust() } else { Profile::body() } }
 }
@@ -63,7 +65,7 @@ pub struct Capture {
 impl Capture {
     pub fn new(seg: Segmenter) -> Self { Capture::with(seg, Profile::body()) }
     pub fn with(seg: Segmenter, profile: Profile) -> Self {
-        Capture { profile, seg, trk: Tracker::with(profile.icp_max_d, profile.icp_rms), caps: Vec::new(), mask_px: Vec::new() }
+        Capture { profile, seg, trk: Tracker::with(profile.icp_max_d, profile.icp_rms, profile.key_deg), caps: Vec::new(), mask_px: Vec::new() }
     }
 
     /// Returns (mask, used). `used` is false when the person wasn't usable in this frame.
@@ -212,7 +214,7 @@ pub fn rescan(folder: &Path, out: Option<&Path>, log: &mut dyn FnMut(String), re
         let (lo, hi) = (f(&cfg["y_lo"]), f(&cfg["y_hi"]));
         seg.y_lo = lo;
         seg.y_hi = hi;
-        seg.radius = 0.45;
+        seg.bust_defaults();
         y_range = (lo, hi);
     }
     if let (Some(c), false) = (cfg["center"].as_array(), refloor) {

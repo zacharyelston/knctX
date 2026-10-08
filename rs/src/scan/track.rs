@@ -168,13 +168,12 @@ pub struct Tracker {
     /// ICP correspondence limit (m) and the rms (m) below which a track is accepted.
     max_d: f32,
     rms_ok: f64,
+    key_deg: f64,
 }
 
-const KEY_DEG: f64 = 12.0;
-
 impl Tracker {
-    pub fn new() -> Self { Tracker::with(0.10, 0.04) }
-    pub fn with(max_d: f32, rms_ok: f64) -> Self { Tracker { key: None, grid: None, key_pose: [0.0; 3], pose: [0.0; 3], vel: 0.0, last_phi: 0.0, quality: 1.0, max_d, rms_ok } }
+    pub fn new() -> Self { Tracker::with(0.10, 0.04, 12.0) }
+    pub fn with(max_d: f32, rms_ok: f64, key_deg: f64) -> Self { Tracker { key: None, grid: None, key_pose: [0.0; 3], pose: [0.0; 3], vel: 0.0, last_phi: 0.0, quality: 1.0, max_d, rms_ok, key_deg } }
     pub fn yaw(&self) -> f64 { self.pose[0] }
 
     pub fn add(&mut self, pts: &[V3]) -> Pose {
@@ -201,7 +200,7 @@ impl Tracker {
             self.vel = 0.6 * self.vel + 0.4 * (self.pose[0] - self.last_phi);
         }
         self.last_phi = self.pose[0];
-        if ok && rel[0].abs() > KEY_DEG.to_radians() {
+        if ok && rel[0].abs() > self.key_deg.to_radians() {
             let p = self.pose;
             self.set_key(pts, p);
         }
