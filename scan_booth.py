@@ -60,6 +60,24 @@ def camera_canvas(rgb, mask=None, dim=0.0, mirror=True):
     return big
 
 
+def framing(depth, dist):
+    """Floor-independent check of whether the person runs off the bottom/top of the image.
+
+    Looks for columns holding the person's depth (+-35 cm) through the torso rows that stay
+    at that depth right down to (or up to) the image edge.
+    Returns (feet_cut, head_cut).
+    """
+    z = depth.astype(np.int32)
+    band = (z > 0) & (np.abs(z - dist * 1000) < 350)
+    cols = np.nonzero(band[200:320].sum(0) > 40)[0]
+    if cols.size < 15:
+        return False, False
+    sub = band[:, cols.min():cols.max() + 1]
+    feet = bool(((sub[-4:].any(0)) & (sub[300:476].mean(0) > 0.7)).any())
+    head = bool(((sub[:4].any(0)) & (sub[5:200].mean(0) > 0.7)).any())
+    return feet, head
+
+
 class Booth:
     def __init__(self, src, root, view_dir=None):
         self.src = src
@@ -82,6 +100,7 @@ class Booth:
         self.error = ""
         self.fullscreen = False
         self.force_until = 0.0
+        self.autotilt = True
         self.raw = None
         if view_dir:
             self._open_saved(Path(view_dir))
@@ -107,41 +126,51 @@ class Booth:
         self.probe["t"] = now
         dist = bs.nearest_distance(depth)
         self.probe["dist"] = dist
-        # keep re-fitting the floor (a person at the keyboard gives a bad fit at first)
-        if now - self.probe.get("floor_t", 0) > 2.0:
+        feet_cut = head_cut = False
+        if dist is not None and 1.5 < dist < 5.0:
+            feet_cut, head_cut = framing(depth, dist)
+        # auto-framing: nudge the sensor tilt (rate limited: the motor dislikes rapid moves)
+        if self.autotilt and dist is not None and 2.2 < dist < 4.6 and now - self.probe.get("tilt_t", 0) > 2.5:
+            step = -4 if (feet_cut and not head_cut) else (4 if (head_cut and not feet_cut) else 0)
+            new = int(np.clip(self.src.tilt_target + step, -27, 27))
+            if step and new != self.src.tilt_target:
+                self.src.tilt_target = new
+                self.probe["tilt_t"] = now
+        # keep re-fitting the floor, but never trust a fit while the feet are out of view
+        if feet_cut:
+            self.world = bs.World()
+        elif now - self.probe.get("floor_t", 0) > 2.0:
             self.probe["floor_t"] = now
             w = bs.fit_floor(depth)
             if w is not None:
                 self.world = w
             elif dist is not None and dist < 1.8:
-                self.world = bs.World()  # too close to see the floor: forget any stale fit
+                self.world = bs.World()
         seg = bs.Segmenter(self.world)
         res = seg.find_person(depth)
         if res is not None:
             self.probe["last_res"], self.probe["last_res_t"] = res, now
         elif now - self.probe.get("last_res_t", 0) < 1.5:
             res = self.probe["last_res"]  # brief dropouts (e.g. side-on pose) shouldn't flicker the status
+        auto = " (auto-tilting)" if self.autotilt else ""
         if dist is None:
             self.probe.update(text="Nothing in view - step in front of the sensor", ok=False)
         elif dist < 2.4:
             self.probe.update(text=f"{dist:.1f} m - too close, step back to about 3 m", ok=False)
         elif dist > 4.0:
             self.probe.update(text=f"{dist:.1f} m - too far, come closer (about 3 m)", ok=False)
+        elif feet_cut and head_cut:
+            self.probe.update(text=f"{dist:.1f} m - head and feet cut off: step back", ok=False)
+        elif feet_cut:
+            self.probe.update(text=f"{dist:.1f} m - feet cut off: tilting sensor down{auto}, or step back", ok=False)
+        elif head_cut:
+            self.probe.update(text=f"{dist:.1f} m - head cut off: tilting sensor up{auto}, or step back", ok=False)
         elif res is None:
             self.probe.update(text=f"{dist:.1f} m - good distance, but I can't see a full person yet", ok=False)
+        elif res[1] < 1.3 or not self.world.floor_found:
+            self.probe.update(text=f"{dist:.1f} m - can't see the floor at your feet: tilt down a little or step back", ok=False)
         else:
-            m, pw = seg.mask(depth)
-            ymin = float(np.percentile(pw[m][:, 1], 1)) if m.any() else 9.0
-            if m[-4:].any() or ymin > 0.35:
-                self.probe.update(text=f"{dist:.1f} m - feet cut off: tilt the sensor down (Down arrow) or step back", ok=False)
-            elif m[:4].any():
-                self.probe.update(text=f"{dist:.1f} m - head cut off: tilt the sensor up (Up arrow) or step back", ok=False)
-            elif res[1] < 1.3:
-                self.probe.update(text=f"{dist:.1f} m - I only see {res[1]:.1f} m of you: step back or tilt so your whole body is in view", ok=False)
-            elif not self.world.floor_found:
-                self.probe.update(text=f"{dist:.1f} m - can't see the floor, tilt the sensor down a little", ok=False)
-            else:
-                self.probe.update(text=f"Perfect - {res[1]:.2f} m tall, {dist:.1f} m away", ok=True)
+            self.probe.update(text=f"Perfect - {res[1]:.2f} m tall, {dist:.1f} m away", ok=True)
 
     def _distance_meter(self, c, y):
         """Horizontal 1-5 m scale with the ideal zone in green and a marker at the current distance."""
@@ -260,6 +289,9 @@ class Booth:
             else:
                 self.force_until = time.time() + 6
                 self.toast("Not ready - press ENTER again to scan anyway", 6)
+        elif key == 9:
+            self.autotilt = not self.autotilt
+            self.toast(f"Auto-tilt {'on' if self.autotilt else 'off'}")
         elif key in KEY_BACK:
             self.name = self.name[:-1]
         elif 32 <= key < 127 and len(self.name) < 24:
@@ -286,7 +318,7 @@ class Booth:
         self._distance_meter(c, CH - 168)
         text_c(c, "Stand ~3 m back, arms slightly away from your body (A-pose)", CH - 106, 0.6, (210, 210, 210), 1, False)
         text_c(c, "After 3-2-1, turn slowly on the spot - TWO full turns (about 10 s each)", CH - 80, 0.6, (210, 210, 210), 1, False)
-        text_c(c, f"Up/Down arrows tilt the sensor ({self.src.tilt_target} deg)   Esc quits", CH - 50, 0.5, (150, 150, 150), 1, False)
+        text_c(c, f"Tilt {self.src.tilt_target:+d} deg ({'auto' if self.autotilt else 'manual'}, Tab toggles)  Up/Down arrows tilt   Esc quits", CH - 50, 0.5, (150, 150, 150), 1, False)
         return c
 
     def _tick_countdown(self, key):
