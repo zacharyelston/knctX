@@ -566,14 +566,28 @@ fn main() {
     win.set_target_fps(30);
     let mut canvas = Canvas::new(W, H);
     let mut was_down = false;
+    let mut quiet_until = Instant::now();
     while win.is_open() {
         app.poll();
         let mouse = win.get_mouse_pos(MouseMode::Clamp).unwrap_or((-1.0, -1.0));
         let down = win.get_mouse_down(MouseButton::Left);
         let clicked = down && !was_down;
         was_down = down;
-        let keys = win.get_keys_pressed(KeyRepeat::Yes);
+        // no key auto-repeat for launching: a key-up lost to the tool's window would otherwise look
+        // like a held key and re-launch the tool every time it closes
+        let mut keys = win.get_keys_pressed(KeyRepeat::No);
+        if !win.is_active() {
+            keys.clear();
+        }
         let busy = app.running.is_some();
+        if busy {
+            quiet_until = Instant::now() + Duration::from_millis(600);
+        }
+        let quiet = Instant::now() < quiet_until;
+        if quiet {
+            keys.clear();
+        }
+        let clicked = clicked && !quiet && win.is_active();
         if !busy {
             let wheel = win.get_scroll_wheel().map_or(0.0, |w| w.1);
             match app.screen {
