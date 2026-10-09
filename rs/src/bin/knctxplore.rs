@@ -490,7 +490,7 @@ fn draw_running(app: &App, c: &mut Canvas) {
     c.rect(W as i32 / 2 - 330, H as i32 / 2 - 90, W as i32 / 2 + 330, H as i32 / 2 - 84, ACCENT);
     c.text_c(&r.label, H as i32 / 2 - 20, 0.9, TXT, false);
     let dots = ".".repeat(1 + (r.started.elapsed().as_millis() / 400 % 3) as usize);
-    c.text_c(&format!("Running{dots}  close its window to come back here"), H as i32 / 2 + 40, 0.5, DIM, false);
+    c.text_c(&format!("Running{dots}  close its window - or press Esc here - to come back"), H as i32 / 2 + 40, 0.5, DIM, false);
 }
 
 fn draw_toast(app: &App, c: &mut Canvas) {
@@ -580,6 +580,11 @@ fn main() {
             keys.clear();
         }
         let busy = app.running.is_some();
+        if busy && keys.contains(&Key::Escape) {
+            if let Some(r) = &mut app.running {
+                let _ = r.child.kill();
+            }
+        }
         if busy {
             quiet_until = Instant::now() + Duration::from_millis(600);
         }
