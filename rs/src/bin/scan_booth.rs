@@ -653,7 +653,7 @@ fn main() {
     win.set_input_callback(Box::new(Chars(typed.clone())));
     while win.is_open() {
         let inp = Input { chars: std::mem::take(&mut *typed.lock().unwrap()), keys: win.get_keys_pressed(KeyRepeat::Yes) };
-        if inp.key(Key::Escape) && matches!(booth.state, State::Name | State::View) {
+        if inp.key(Key::Escape) && !matches!(booth.state, State::Capture) {
             break;
         }
         let pos = win.get_mouse_pos(MouseMode::Clamp);
