@@ -5,6 +5,20 @@ colorized depth map overlaid, plus a configurable grid of distance measurements.
 
 Uses libfreenect's registered depth, so depth pixels are aligned to the color camera.
 
+## KnctXplore (the app)
+
+One menu for everything: live viewer, body booth, bust booth, scan library (view / rebuild any saved
+scan), recordings playback and the self-test. Each tool opens in its own window; close it to return.
+
+```bash
+cd rs && ./install.sh   # builds, adds "KnctXplore" to the app menu and a `knctxplore` command
+knctxplore              # or launch it from the menu
+```
+
+Keys: arrows / 1-6 / click to choose, Enter to open, `D` toggles demo mode (booths use a synthetic
+person instead of the Kinect), Esc goes back. In the Scan Library, `R` rebuilds the selected scan from
+its raw frames. `knctxplore --shot home out.png` renders a screen headlessly.
+
 ## Requirements
 
 - `libfreenect` with Python 3 bindings (Arch: AUR `libfreenect`)
