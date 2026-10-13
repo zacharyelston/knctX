@@ -94,6 +94,7 @@ impl Kinect2 {
             while self.running.load(Ordering::SeqCst) {
                 match unsafe { k2_wait_cloud(h, 1000, xyz.as_mut_ptr(), rgb.as_mut_ptr()) } {
                     1 => {
+                        if timeouts > 0 { self.set_status(format!("Kinect v2 {serial} ({pipe})")); }
                         timeouts = 0;
                         let mut pts = Vec::with_capacity(W * H / 2);
                         let mut col = Vec::with_capacity(W * H / 2);

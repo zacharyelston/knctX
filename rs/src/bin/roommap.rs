@@ -9,7 +9,8 @@
 //! View:  W/S dolly, A/D strafe, R/F up/down, Home reset, 1/2 toggle v1/v2, M map on/off,
 //!        L live clouds on/off, X mirror, P point size
 //! v2 pose: arrows = move x/z, PgUp/PgDn = move y, Z/C yaw, T/G pitch, V/B roll
-//!        (hold Shift for fine steps), I = ICP refine, O = reset pose, K = save pose
+//!        (hold Shift for fine steps), I = ICP refine, Y = flip v2 mirror, J = tint clouds
+//!        per sensor to judge alignment (or start with --tint), O = reset pose, K = save pose
 //! Map:   N clear map, E export PLY to ../pointclouds/
 
 use std::collections::HashMap;
@@ -19,8 +20,8 @@ use std::time::Instant;
 use kinect3d::gfx::{Canvas, Col};
 use kinect3d::kinect2::{Cloud, Kinect2};
 use kinect3d::math::*;
-use kinect3d::scan::world::cam_point;
-use kinect3d::source::{Kinect, Source, H as H1, W as W1};
+use kinect3d::scan::world::{CX as CX1, CY as CY1, FX as FX1_DEFAULT};
+use kinect3d::source::{Depth, Kinect, Rgb, Source, H as H1, W as W1};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 
 const CW: usize = 1280;
@@ -69,17 +70,21 @@ struct Grid {
     cell: f32,
     map: HashMap<(i32, i32, i32), Vec<u32>>,
     pts: Vec<V3>,
+    lum: Vec<f32>,
 }
 
 impl Grid {
-    fn new(pts: Vec<V3>, cell: f32) -> Grid {
+    fn new(pts: Vec<V3>, lum: Vec<f32>, cell: f32) -> Grid {
         let mut map: HashMap<(i32, i32, i32), Vec<u32>> = HashMap::new();
         for (i, p) in pts.iter().enumerate() {
             map.entry(key(*p, cell)).or_default().push(i as u32);
         }
-        Grid { cell, map, pts }
+        Grid { cell, map, pts, lum }
     }
-    fn nearest(&self, q: V3, max_d: f32) -> Option<(V3, f32)> {
+    /// Nearest point within `max_d`; with `lum = Some((l, tol))` only points whose
+    /// (normalised) luminance is within `tol` of `l` qualify, so a dark picture frame
+    /// cannot be matched to the bright wall around it.
+    fn nearest(&self, q: V3, max_d: f32, lum: Option<(f32, f32)>) -> Option<(V3, f32)> {
         let k = key(q, self.cell);
         let reach = (max_d / self.cell).ceil() as i32;
         let mut best: Option<(V3, f32)> = None;
@@ -88,6 +93,7 @@ impl Grid {
                 for dz in -reach..=reach {
                     if let Some(ids) = self.map.get(&(k.0 + dx, k.1 + dy, k.2 + dz)) {
                         for &i in ids {
+                            if let Some((l, tol)) = lum { if (self.lum[i as usize] - l).abs() > tol { continue; } }
                             let p = self.pts[i as usize];
                             let d = norm(sub(p, q));
                             if d <= max_d && best.map_or(true, |b| d < b.1) { best = Some((p, d)); }
@@ -105,10 +111,23 @@ fn key(p: V3, cell: f32) -> (i32, i32, i32) {
     ((p[0] / cell).floor() as i32, (p[1] / cell).floor() as i32, (p[2] / cell).floor() as i32)
 }
 
-/// Keep one point per `cell`-sized voxel.
-fn voxel_downsample(pts: &[V3], cell: f32) -> Vec<V3> {
+/// Keep one point (and its luminance) per `cell`-sized voxel.
+fn voxel_downsample(pts: &[V3], lum: &[f32], cell: f32) -> (Vec<V3>, Vec<f32>) {
     let mut seen = std::collections::HashSet::new();
-    pts.iter().copied().filter(|p| seen.insert(key(*p, cell))).collect()
+    let mut p_out = Vec::new();
+    let mut l_out = Vec::new();
+    for (p, l) in pts.iter().zip(lum) {
+        if seen.insert(key(*p, cell)) { p_out.push(*p); l_out.push(*l); }
+    }
+    (p_out, l_out)
+}
+
+/// Luminance (0..1) of each point, shifted so the cloud's mean is 0.5: the two
+/// sensors have different exposure and white balance, only contrast is comparable.
+fn luminance(col: &[[u8; 3]]) -> Vec<f32> {
+    let l: Vec<f32> = col.iter().map(|c| (0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32) / 255.0).collect();
+    let mean = l.iter().sum::<f32>() / l.len().max(1) as f32;
+    l.iter().map(|v| (v - mean + 0.5).clamp(0.0, 1.0)).collect()
 }
 
 /// Best rigid transform mapping `src[i]` onto `dst[i]` (Horn's quaternion method).
@@ -151,23 +170,25 @@ fn kabsch(src: &[V3], dst: &[V3]) -> Pose {
 
 /// Point-to-point ICP: refine `init` so that init(src) lands on `tgt`.
 /// Returns the pose, final RMS residual (m) and the inlier fraction.
-fn icp(src: &[V3], tgt: &[V3], init: Pose, log: &mut dyn FnMut(String)) -> (Pose, f32, f32) {
-    let src = voxel_downsample(src, 0.05);
-    let tgt = voxel_downsample(tgt, 0.04);
+fn icp(src: &[V3], src_col: &[[u8; 3]], tgt: &[V3], tgt_col: &[[u8; 3]], init: Pose, log: &mut dyn FnMut(String)) -> (Pose, f32, f32) {
+    let (src, src_l) = voxel_downsample(src, &luminance(src_col), 0.05);
+    let (tgt, tgt_l) = voxel_downsample(tgt, &luminance(tgt_col), 0.04);
     let mut pose = init;
     let mut rms = f32::NAN;
     let mut frac = 0.0;
     let schedule = [0.6, 0.4, 0.3, 0.2, 0.15, 0.1, 0.08, 0.06, 0.05];
     for (round, &max_d) in schedule.iter().enumerate() {
         // cell = search radius, so a query touches at most 27 cells
-        let grid = Grid::new(tgt.clone(), max_d);
+        let grid = Grid::new(tgt.clone(), tgt_l.clone(), max_d);
+        // geometry first; once roughly aligned, also require similar brightness
+        let tol = if max_d <= 0.2 { Some(0.18) } else { None };
         for _ in 0..6 {
             let mut a = Vec::new();
             let mut b = Vec::new();
             let mut se = 0.0f32;
-            for p in &src {
+            for (p, l) in src.iter().zip(&src_l) {
                 let w = pose.apply(*p);
-                if let Some((q, d)) = grid.nearest(w, max_d) {
+                if let Some((q, d)) = grid.nearest(w, max_d, tol.map(|t| (*l, t))) {
                     a.push(*p);
                     b.push(q);
                     se += d * d;
@@ -178,7 +199,9 @@ fn icp(src: &[V3], tgt: &[V3], init: Pose, log: &mut dyn FnMut(String)) -> (Pose
             rms = (se / a.len() as f32).sqrt();
             frac = a.len() as f32 / src.len() as f32;
         }
-        log(format!("ICP round {}: max {:.2} m, rms {:.3} m, {:.0}% matched", round + 1, max_d, rms, frac * 100.0));
+        if round == 0 || round == schedule.len() - 1 || round % 3 == 2 {
+            log(format!("ICP round {}: max {:.2} m, rms {:.3} m, {:.0}% matched{}", round + 1, max_d, rms, frac * 100.0, if tol.is_some() { ", colour-gated" } else { "" }));
+        }
     }
     (pose, rms, frac)
 }
@@ -227,8 +250,8 @@ impl VoxelMap {
 
 // ----------------------------------------------------------------------------- live clouds
 
-/// Kinect v1: registered depth + colour -> camera-frame points.
-fn v1_cloud(rgb: &[u8], depth: &[u16], stride: usize) -> (Vec<V3>, Vec<[u8; 3]>) {
+/// Kinect v1: registered depth + colour -> camera-frame points, with focal length `fx`.
+fn v1_cloud(rgb: &[u8], depth: &[u16], stride: usize, fx: f32) -> (Vec<V3>, Vec<[u8; 3]>) {
     let mut pts = Vec::with_capacity(W1 * H1 / (stride * stride));
     let mut col = Vec::with_capacity(pts.capacity());
     for v in (0..H1).step_by(stride) {
@@ -237,7 +260,7 @@ fn v1_cloud(rgb: &[u8], depth: &[u16], stride: usize) -> (Vec<V3>, Vec<[u8; 3]>)
             if d == 0 { continue; }
             let z = d as f32 * 0.001;
             if z > MAX_RANGE { continue; }
-            pts.push(cam_point(u, v, z));
+            pts.push([(u as f32 - CX1) / fx * z, (v as f32 - CY1) / fx * z, z]);
             let i = (v * W1 + u) * 3;
             col.push([rgb[i], rgb[i + 1], rgb[i + 2]]);
         }
@@ -245,15 +268,18 @@ fn v1_cloud(rgb: &[u8], depth: &[u16], stride: usize) -> (Vec<V3>, Vec<[u8; 3]>)
     (pts, col)
 }
 
-/// Kinect v2 cloud sub-sampled by pixel stride.
-fn v2_cloud(c: &Cloud, stride: usize) -> (Vec<V3>, Vec<[u8; 3]>) {
+/// Kinect v2 cloud sub-sampled by pixel stride. libfreenect2 delivers mirrored
+/// images, so by default (`mirror` = true) x is negated to match the Kinect v1.
+fn v2_cloud(c: &Cloud, stride: usize, mirror: bool) -> (Vec<V3>, Vec<[u8; 3]>) {
     let w = kinect3d::kinect2::W as u32;
     let s = stride as u32;
+    let sx = if mirror { -1.0 } else { 1.0 };
     let mut pts = Vec::new();
     let mut col = Vec::new();
     for (i, &pix) in c.pix.iter().enumerate() {
         if pix % w % s == 0 && pix / w % s == 0 && c.pts[i][2] <= MAX_RANGE {
-            pts.push(c.pts[i]);
+            let p = c.pts[i];
+            pts.push([sx * p[0], p[1], p[2]]);
             col.push(c.rgb[i]);
         }
     }
@@ -374,6 +400,12 @@ struct App {
     v1: Kinect,
     v2: Arc<Kinect2>,
     v2_pose: Pose,
+    /// Kinect v1 focal length (px) for the registered depth; calibrated against the v2.
+    v1_fx: f32,
+    v1_raw: Option<(Rgb, Depth)>,
+    /// Flip the v2 cloud's x axis (libfreenect2 images are mirror images).
+    v2_mirror: bool,
+    v2_raw: Option<Arc<Cloud>>,
     map: VoxelMap,
     view: View,
     show_v1: bool,
@@ -391,6 +423,8 @@ struct App {
     icp_pending: bool,
     /// Run ICP once automatically when both sensors are live (no saved pose).
     auto_icp: Option<Instant>,
+    /// Draw v1 points bluish and v2 points orange instead of their colours.
+    tint: bool,
 }
 
 impl App {
@@ -402,15 +436,22 @@ impl App {
 
     fn load_pose(&mut self) {
         if let Ok(txt) = std::fs::read_to_string(POSE_FILE) {
-            if let Some(p) = serde_json::from_str::<serde_json::Value>(&txt).ok().and_then(|v| Pose::from_json(&v)) {
-                self.v2_pose = p;
-                self.auto_icp = None;
-                self.say(format!("loaded v2 pose from {POSE_FILE}"));
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                if let Some(p) = Pose::from_json(&v) {
+                    self.v2_pose = p;
+                    self.auto_icp = None;
+                    if let Some(fx) = v.get("v1_fx").and_then(|f| f.as_f64()) { self.v1_fx = fx as f32; }
+                    if let Some(m) = v.get("v2_mirror").and_then(|f| f.as_bool()) { self.v2_mirror = m; }
+                    self.say(format!("loaded v2 pose from {POSE_FILE} (v1 fx {:.0} px, v2 mirror {})", self.v1_fx, self.v2_mirror));
+                }
             }
         }
     }
     fn save_pose(&mut self) {
-        match std::fs::write(POSE_FILE, serde_json::to_string_pretty(&self.v2_pose.to_json()).unwrap()) {
+        let mut j = self.v2_pose.to_json();
+        j["v1_fx"] = serde_json::json!(self.v1_fx);
+        j["v2_mirror"] = serde_json::json!(self.v2_mirror);
+        match std::fs::write(POSE_FILE, serde_json::to_string_pretty(&j).unwrap()) {
             Ok(_) => self.say(format!("saved v2 pose to {POSE_FILE}")),
             Err(e) => self.say(format!("save failed: {e}")),
         }
@@ -421,28 +462,29 @@ impl App {
         if self.v1.seq() != self.v1_seq {
             if let Some((rgb, depth)) = self.v1.frames() {
                 self.v1_seq = self.v1.seq();
-                let (pts, col) = v1_cloud(&rgb, &depth, 2);
+                let (pts, col) = v1_cloud(&rgb, &depth, 2, self.v1_fx);
                 if self.show_v1 { for (p, c) in pts.iter().zip(&col) { self.map.insert(*p, *c); } }
                 self.v1_last = Some((pts, col));
+                self.v1_raw = Some((rgb, depth));
             }
         }
         if self.v2.seq.load(std::sync::atomic::Ordering::SeqCst) != self.v2_seq {
             if let Some(cloud) = self.v2.cloud() {
                 self.v2_seq = self.v2.seq.load(std::sync::atomic::Ordering::SeqCst);
-                let (pts, col) = v2_cloud(&cloud, 2);
+                let (pts, col) = v2_cloud(&cloud, 2, self.v2_mirror);
                 if self.show_v2 { for (p, c) in pts.iter().zip(&col) { self.map.insert(self.v2_pose.apply(*p), *c); } }
                 self.v2_last = Some((pts, col));
+                self.v2_raw = Some(cloud);
             }
         }
     }
 
     fn run_icp(&mut self) {
         let (Some(v1), Some(v2)) = (&self.v1_last, &self.v2_last) else { self.say("ICP: need frames from both sensors".into()); return };
-        let (src, tgt) = (v2.0.clone(), v1.0.clone());
         let init = self.v2_pose;
         let mut lines = Vec::new();
         let t0 = Instant::now();
-        let (pose, rms, frac) = icp(&src, &tgt, init, &mut |s| lines.push(s));
+        let (pose, rms, frac) = icp(&v2.0, &v2.1, &v1.0, &v1.1, init, &mut |s| lines.push(s));
         for l in lines { self.say(l); }
         if rms.is_finite() && rms < 0.12 && frac > 0.15 {
             self.v2_pose = pose;
@@ -495,6 +537,13 @@ impl App {
                 Key::P => self.point_size = if self.point_size >= 4 { 1 } else { self.point_size + 1 },
                 Key::H => self.help = !self.help,
                 Key::I => self.icp_pending = true,
+                Key::J => { self.tint = !self.tint; }
+                Key::Y => {
+                    self.v2_mirror = !self.v2_mirror;
+                    if let Some(c) = &self.v2_raw { self.v2_last = Some(v2_cloud(c, 2, self.v2_mirror)); }
+                    self.map.cells.clear();
+                    self.say(format!("v2 mirror {}", if self.v2_mirror { "on" } else { "off" }));
+                }
                 Key::O => { self.v2_pose = default_v2_pose(); self.map.cells.clear(); self.say("v2 pose reset".into()); }
                 Key::K => self.save_pose(),
                 Key::N => { self.map.cells.clear(); self.say("map cleared".into()); }
@@ -518,12 +567,16 @@ impl App {
     fn draw(&self, w: usize, h: usize) -> Canvas {
         let mut fr = Frame3D::new(&self.view, w, h);
         let mx = |p: V3| if self.mirror { [-p[0], p[1], p[2]] } else { p };
-        if self.show_map {
+        if self.show_map && !self.tint {
             for (p, c) in self.map.points() { fr.splat(mx(p), c, self.point_size + 1); }
         }
-        if self.show_live {
-            if self.show_v1 { if let Some((pts, col)) = &self.v1_last { for (p, c) in pts.iter().zip(col) { fr.splat(mx(*p), *c, self.point_size); } } }
-            if self.show_v2 { if let Some((pts, col)) = &self.v2_last { for (p, c) in pts.iter().zip(col) { fr.splat(mx(self.v2_pose.apply(*p)), *c, self.point_size); } } }
+        if self.show_live || self.tint {
+            let tint = |c: &[u8; 3], hue: [f32; 3]| -> Col {
+                let l = (0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32) * 0.6 + 90.0;
+                [(l * hue[0]) as u8, (l * hue[1]) as u8, (l * hue[2]) as u8]
+            };
+            if self.show_v1 { if let Some((pts, col)) = &self.v1_last { for (p, c) in pts.iter().zip(col) { fr.splat(mx(*p), if self.tint { tint(c, [0.45, 0.7, 1.0]) } else { *c }, self.point_size); } } }
+            if self.show_v2 { if let Some((pts, col)) = &self.v2_last { for (p, c) in pts.iter().zip(col) { fr.splat(mx(self.v2_pose.apply(*p)), if self.tint { tint(c, [1.0, 0.65, 0.3]) } else { *c }, self.point_size); } } }
         }
         // floor guess: 97th percentile of map y (y is down)
         let mut ys: Vec<f32> = self.map.points().map(|(p, _)| p[1]).collect();
@@ -545,15 +598,15 @@ impl App {
         let sc = 0.45;
         let v1_ok = self.v1.frames().is_some();
         let st = format!(
-            "v1 {}  |  {}  |  map {} voxels ({:.0} MB)  |  v2 pose t=({:.2},{:.2},{:.2})  |  {}{}{}",
-            if v1_ok { "live" } else { "no frames" },
-            self.v2.status(),
+            "v1 {}  |  {}{}  |  map {} voxels ({:.0} MB)  |  v2 pose t=({:.2},{:.2},{:.2})  |  {}{}{}{}",
+            if v1_ok { "live" } else { "no frames" }, self.v2.status(), if self.v2_mirror { " (mirror)" } else { "" },
             self.map.cells.len(),
             self.map.cells.len() as f32 * 48.0 / 1e6,
             self.v2_pose.t[0], self.v2_pose.t[1], self.v2_pose.t[2],
             if self.show_v1 { "[1]v1 " } else { "[1]-- " },
             if self.show_v2 { "[2]v2 " } else { "[2]-- " },
             if self.show_map { "[M]map " } else { "[M]live-only " },
+            if self.tint { "[J]tint " } else { "" },
         );
         c.panel(0, 0, c.w as i32, 26, 0.6);
         c.text(&st, 8, 5, sc, [230, 230, 230], false);
@@ -569,7 +622,7 @@ impl App {
                 "Mouse drag: orbit   wheel: zoom   W/S/A/D/R/F: move view   Home: reset view",
                 "1 / 2: include v1 / v2      M: show map      L: show live clouds      X: mirror      P: point size",
                 "v2 pose:  arrows = move x/z   PgUp/PgDn = move y   Z/C yaw   T/G pitch   V/B roll   (Shift = fine)",
-                "I: ICP refine v2 pose against v1 (needs overlap)    O: reset pose    K: save pose",
+                "I: ICP refine v2 pose    Y: flip v2 mirror    J: tint clouds (v1 blue / v2 orange) to judge alignment    O: reset pose    K: save pose",
                 "N: clear map      E: export PLY to ../pointclouds/      Esc/Q: quit",
             ];
             let hh = 20 * lines.len() as i32 + 20;
@@ -587,6 +640,10 @@ fn main() {
         v1,
         v2,
         v2_pose: default_v2_pose(),
+        v1_fx: FX1_DEFAULT,
+        v1_raw: None,
+        v2_mirror: true,
+        v2_raw: None,
         map: VoxelMap::default(),
         view: View::default(),
         show_v1: true,
@@ -603,6 +660,7 @@ fn main() {
         v2_last: None,
         icp_pending: false,
         auto_icp: Some(Instant::now()),
+        tint: std::env::args().any(|a| a == "--tint"),
     };
     app.load_pose();
     if app.auto_icp.is_some() { app.say("no saved pose: ICP will align the Kinect v2 automatically once both sensors are live".into()); }

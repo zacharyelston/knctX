@@ -25,7 +25,10 @@ its raw frames. `knctxplore --shot home out.png` renders a screen headlessly.
 (libfreenect2, registered XYZ+RGB) into one coloured voxel map (3 cm) and renders it with an
 orbit camera. The v2's pose relative to the v1 is found automatically with ICP on first start
 (both sensors must see some of the same scene) and saved to `rs/roommap_pose.json`; it can also
-be nudged by hand and refined again with `I`. `E` exports the map as PLY to `pointclouds/`.
+be nudged by hand and refined again with `I`. libfreenect2 delivers mirror images, so the v2
+cloud is flipped to match the v1 (`Y` toggles this). `J` (or `--tint`) colours the clouds per
+sensor, blue v1 / orange v2, to judge the alignment. ICP matches brightness as well as
+position in its fine rounds so flat walls cannot slide. `E` exports the map as PLY to `pointclouds/`.
 
 ```bash
 cd rs && cargo run --release --bin roommap     # press H for the key list
