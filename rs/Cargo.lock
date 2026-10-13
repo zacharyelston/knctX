@@ -350,9 +350,11 @@ dependencies = [
 name = "kinect3d"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "fontdue",
  "image",
  "minifb",
+ "pkg-config",
  "rayon",
  "serde_json",
 ]

@@ -3,6 +3,16 @@ name = "kinect3d"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Kinect v2 through libfreenect2 (needed by roommap). Disable with
+# --no-default-features if libfreenect2 is not installed.
+default = ["kinect2"]
+kinect2 = ["dep:cc", "dep:pkg-config"]
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+pkg-config = { version = "0.3", optional = true }
+
 [dependencies]
 minifb = "0.29.0"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }

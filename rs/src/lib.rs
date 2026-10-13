@@ -1,5 +1,7 @@
 pub mod gfx;
 pub mod io;
+#[cfg(feature = "kinect2")]
+pub mod kinect2;
 pub mod math;
 pub mod render;
 pub mod scan;

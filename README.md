@@ -19,6 +19,23 @@ Keys: arrows / 1-6 / click to choose, Enter to open, `D` toggles demo mode (boot
 person instead of the Kinect), Esc goes back. In the Scan Library, `R` rebuilds the selected scan from
 its raw frames. `knctxplore --shot home out.png` renders a screen headlessly.
 
+## roommap (3D map of the room from both Kinects)
+
+`rs/src/bin/roommap.rs` fuses the Kinect v1 (libfreenect, registered depth) and the Kinect v2
+(libfreenect2, registered XYZ+RGB) into one coloured voxel map (3 cm) and renders it with an
+orbit camera. The v2's pose relative to the v1 is found automatically with ICP on first start
+(both sensors must see some of the same scene) and saved to `rs/roommap_pose.json`; it can also
+be nudged by hand and refined again with `I`. `E` exports the map as PLY to `pointclouds/`.
+
+```bash
+cd rs && cargo run --release --bin roommap     # press H for the key list
+```
+
+Both sensors are user-space USB drivers and together need more than the kernel's default
+16 MB usbfs transfer budget (`libusb` then fails with LIBUSB_ERROR_IO). This machine has
+`/etc/tmpfiles.d/usbfs-memory.conf` raising `usbfs_memory_mb` to 128. camgrid and roommap
+cannot run at the same time: each needs exclusive access to the sensors.
+
 ## camgrid (all cameras at once)
 
 `camgrid/` is a separate Rust app that shows every camera on the machine in one window:

@@ -4,3 +4,4 @@ pointclouds/
 recordings/
 scans/
 rs/target/
+rs/roommap_pose.json
