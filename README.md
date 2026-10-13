@@ -23,6 +23,28 @@ Keys: `1`..`9` focus one camera, `0`/`G` back to the grid, `R` force a full resc
 - **Display.** A minifb window; tiles are aspect-fit with device, name, format
   and live fps underneath.
 
+## Kinect v2 (Xbox One)
+
+The Kinect v2 has no kernel V4L2 driver; it is driven in user space by
+libfreenect2. Build with the `kinect2` feature to get two extra tiles per
+sensor: the 1920x1080 color camera and the 512x424 depth map (red = 0.5 m,
+blue = 4.5 m, black = no reading).
+
+    # Arch: the AUR libfreenect2 package no longer configures under CMake 4;
+    # contrib/libfreenect2/PKGBUILD is a patched copy that does.
+    (cd contrib/libfreenect2 && makepkg -si)
+    cargo run --release --features kinect2
+
+Requirements: a USB 3 port (the sensor streams ~300 Mbit/s), and udev access
+to 045e:02c4 / 02d8 / 02d9 for your user (the package installs
+65-kinect2.rules; replug the sensor after installing).
+
+Depth processing uses OpenCL when an ICD is registered in /etc/OpenCL/vendors,
+else OpenGL, else CPU; `CAMGRID_K2_PIPELINE=cpu|gl|cl` forces one. JPEG
+decoding uses TurboJPEG: libfreenect2's VA-API decoder is disabled because it
+silently produces no color frames on machines without a working VA driver
+(NVIDIA). Set `CAMGRID_K2_VAAPI=1` to let it try VA-API anyway.
+
 ## USB bandwidth note
 
 A high-speed (480 Mbit/s) USB bus has a fixed isochronous budget shared by every

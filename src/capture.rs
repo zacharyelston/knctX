@@ -6,7 +6,7 @@
 //! publishes the newest frame into a shared [`Slot`].
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -41,7 +41,7 @@ pub struct Slot {
 }
 
 impl Slot {
-    fn new() -> Arc<Slot> {
+    pub fn new() -> Arc<Slot> {
         Arc::new(Slot {
             frame: Mutex::new(None),
             status: Mutex::new("starting".into()),
@@ -55,38 +55,72 @@ impl Slot {
     pub fn status(&self) -> String { self.status.lock().unwrap().clone() }
     /// Time since the most recent decoded frame (or since the camera was opened).
     pub fn since_last_frame(&self) -> Duration { self.last_frame.lock().unwrap().elapsed() }
-    fn set_status(&self, s: impl Into<String>) { *self.status.lock().unwrap() = s.into(); }
-    fn publish(&self, f: Frame) {
+    pub fn set_status(&self, s: impl Into<String>) { *self.status.lock().unwrap() = s.into(); }
+    pub fn publish(&self, f: Frame) {
         *self.frame.lock().unwrap() = Some(Arc::new(f));
         *self.last_frame.lock().unwrap() = Instant::now();
         self.seq.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-/// A camera that is being captured on its own thread.
+/// The thread behind one or more cameras. Dropping the last `Camera` that
+/// refers to it asks the thread to stop and joins it.
+pub struct Worker {
+    pub running: AtomicBool,
+    handle: Mutex<Option<JoinHandle<()>>>,
+    tiles: AtomicUsize,
+}
+
+impl Worker {
+    pub fn spawn<F: FnOnce(Arc<Worker>) + Send + 'static>(name: &str, f: F) -> std::io::Result<Arc<Worker>> {
+        let w = Arc::new(Worker { running: AtomicBool::new(true), handle: Mutex::new(None), tiles: AtomicUsize::new(0) });
+        let wt = w.clone();
+        let h = std::thread::Builder::new().name(name.to_string()).spawn(move || f(wt))?;
+        *w.handle.lock().unwrap() = Some(h);
+        Ok(w)
+    }
+    pub fn is_running(&self) -> bool { self.running.load(Ordering::Relaxed) }
+    /// Register one more tile fed by this worker (see `Camera::drop`).
+    pub fn attach(self: &Arc<Self>) -> Arc<Self> { self.tiles.fetch_add(1, Ordering::SeqCst); self.clone() }
+    pub fn is_finished(&self) -> bool { self.handle.lock().unwrap().as_ref().map_or(true, |h| h.is_finished()) }
+}
+
+/// A camera tile: a frame slot plus the worker thread that fills it.
 pub struct Camera {
+    /// Unique id: a /dev path for V4L2 devices, "kinect2:<serial>/<stream>" for Kinect v2.
     pub path: String,
     pub name: String,
     pub fourcc: String,
     pub width: u32,
     pub height: u32,
     pub slot: Arc<Slot>,
-    handle: Option<JoinHandle<()>>,
+    pub worker: Arc<Worker>,
 }
 
 impl Camera {
     /// True once the capture thread has exited (device unplugged or gave up).
-    pub fn is_dead(&self) -> bool { self.handle.as_ref().map_or(true, |h| h.is_finished()) }
+    pub fn is_dead(&self) -> bool { self.worker.is_finished() }
+
+    /// Short device id for the label (e.g. "video3" or "kinect2").
+    pub fn short_id(&self) -> String {
+        if let Some(rest) = self.path.strip_prefix("/dev/") { return rest.to_string(); }
+        self.path.split(':').next().unwrap_or(&self.path).to_string()
+    }
 
     pub fn label(&self) -> String {
-        format!("{}  {}  {}x{} {}", self.path.trim_start_matches("/dev/"), self.name, self.width, self.height, self.fourcc)
+        format!("{}  {}  {}x{} {}", self.short_id(), self.name, self.width, self.height, self.fourcc)
     }
 }
 
 impl Drop for Camera {
     fn drop(&mut self) {
         self.slot.running.store(false, Ordering::Relaxed);
-        if let Some(h) = self.handle.take() { let _ = h.join(); }
+        // Last tile on this worker: stop the thread and wait for it so the
+        // device is released before anything tries to reopen it.
+        if self.worker.tiles.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.worker.running.store(false, Ordering::Relaxed);
+            if let Some(h) = self.worker.handle.lock().unwrap().take() { let _ = h.join(); }
+        }
     }
 }
 
@@ -122,6 +156,10 @@ fn dev_index(path: &str) -> u32 { path.trim_start_matches("/dev/video").parse().
 pub struct Watcher {
     not_camera: HashSet<String>,
     failed: HashMap<String, Instant>,
+    #[cfg_attr(not(feature = "kinect2"), allow(dead_code))]
+    last_k2_scan: Option<Instant>,
+    #[cfg_attr(not(feature = "kinect2"), allow(dead_code))]
+    k2_misses: HashMap<String, u32>,
 }
 
 impl Watcher {
@@ -138,6 +176,7 @@ impl Watcher {
         // Drop cameras that were unplugged or whose thread exited.
         let before = cams.len();
         cams.retain(|c| {
+            if !c.path.starts_with("/dev/") { return true; } // not ours (Kinect v2 etc.)
             let keep = present_set.contains(&c.path) && !c.is_dead();
             if !keep { eprintln!("{}: removed ({})", c.path, if c.is_dead() { "stream ended" } else { "device gone" }); }
             keep
@@ -164,9 +203,66 @@ impl Watcher {
                 }
             }
         }
-        if changed { cams.sort_by_key(|c| dev_index(&c.path)); }
+        changed |= self.poll_kinect2(cams);
+
+        if changed { cams.sort_by(|a, b| sort_key(&a.path).cmp(&sort_key(&b.path))); }
         changed
     }
+
+    /// Kinect v2 sensors speak libusb, not V4L2, so they are enumerated
+    /// separately (every 3 s; a libusb scan is heavier than a readdir).
+    #[cfg(feature = "kinect2")]
+    fn poll_kinect2(&mut self, cams: &mut Vec<Camera>) -> bool {
+        if self.last_k2_scan.map_or(false, |t| t.elapsed() < Duration::from_secs(3)) { return false; }
+        self.last_k2_scan = Some(Instant::now());
+        let serials = crate::kinect2::enumerate();
+        if std::env::var_os("CAMGRID_DEBUG").is_some() { eprintln!("kinect2 scan: {serials:?}"); }
+        let mut changed = false;
+
+        // A libusb scan can miss an open device transiently; only drop a
+        // sensor after two consecutive misses (or if its thread died).
+        let before = cams.len();
+        cams.retain(|c| {
+            let Some(serial) = crate::kinect2::serial_of(&c.path) else { return true };
+            let present = serials.iter().any(|s| s == serial);
+            let misses = self.k2_misses.entry(serial.to_string()).or_insert(0);
+            *misses = if present { 0 } else { *misses + 1 };
+            let keep = *misses < 2 && !c.is_dead();
+            if !keep { eprintln!("{}: removed ({})", c.path, if c.is_dead() { "stream ended" } else { "device gone" }); }
+            keep
+        });
+        changed |= cams.len() != before;
+        self.failed.retain(|p, _| !p.starts_with("kinect2:") || serials.iter().any(|s| p == &format!("kinect2:{s}")));
+
+        for serial in &serials {
+            let key = format!("kinect2:{serial}");
+            if cams.iter().any(|c| crate::kinect2::serial_of(&c.path) == Some(serial)) { continue; }
+            if let Some(t) = self.failed.get(&key) {
+                if t.elapsed() < Duration::from_secs(5) { continue; }
+            }
+            match crate::kinect2::open(serial) {
+                Ok(new) => {
+                    for c in &new { eprintln!("{}: added  {}", c.path, c.label()); }
+                    cams.extend(new);
+                    self.failed.remove(&key);
+                    changed = true;
+                }
+                Err(e) => {
+                    if !self.failed.contains_key(&key) { eprintln!("{key}: open failed ({e}), will retry"); }
+                    self.failed.insert(key, Instant::now());
+                }
+            }
+        }
+        changed
+    }
+
+    #[cfg(not(feature = "kinect2"))]
+    fn poll_kinect2(&mut self, _cams: &mut Vec<Camera>) -> bool { false }
+}
+
+/// V4L2 devices first (by number), then Kinect v2 streams (by serial, color before depth).
+fn sort_key(path: &str) -> (u8, u32, String) {
+    if path.starts_with("/dev/") { (0, dev_index(path), String::new()) } else { (1, 0, path.to_string()) }
 }
 
 /// Open a device, pick a format, and spawn its capture thread.
@@ -213,9 +309,7 @@ fn probe(path: &str) -> std::io::Result<Option<Camera>> {
 
     let t_slot = slot.clone();
     let t_path = path.to_string();
-    let handle = std::thread::Builder::new()
-        .name(format!("cap-{}", path.trim_start_matches("/dev/")))
-        .spawn(move || capture_loop(dev, fmt, t_slot, t_path))?;
+    let worker = Worker::spawn(&format!("cap-{}", path.trim_start_matches("/dev/")), move |w| capture_loop(dev, fmt, t_slot, t_path, w))?;
 
     Ok(Some(Camera {
         path: path.to_string(),
@@ -224,7 +318,7 @@ fn probe(path: &str) -> std::io::Result<Option<Camera>> {
         width: fmt.width,
         height: fmt.height,
         slot,
-        handle: Some(handle),
+        worker: worker.attach(),
     }))
 }
 
@@ -247,18 +341,18 @@ fn is_gone(e: &std::io::Error) -> bool { e.raw_os_error() == Some(19) } // ENODE
 /// device disappears or the camera is dropped, so a transient condition
 /// (bus bandwidth, another program holding the device) shows as a status
 /// on the tile and recovers by itself when it clears.
-fn capture_loop(dev: Device, fmt: Format, slot: Arc<Slot>, path: String) {
+fn capture_loop(dev: Device, fmt: Format, slot: Arc<Slot>, path: String, worker: Arc<Worker>) {
     let (w, h) = (fmt.width as usize, fmt.height as usize);
     let fourcc = fmt.fourcc;
     let retry = Duration::from_secs(2);
 
-    'outer: while slot.running.load(Ordering::Relaxed) {
+    'outer: while worker.is_running() {
         let mut stream = match MmapStream::with_buffers(&dev, Type::VideoCapture, 4) {
             Ok(s) => s,
             Err(e) => {
                 slot.set_status(explain(&e));
                 if is_gone(&e) { break; }
-                sleep_while_running(&slot, retry);
+                sleep_while_running(&worker, retry);
                 continue;
             }
         };
@@ -266,7 +360,7 @@ fn capture_loop(dev: Device, fmt: Format, slot: Arc<Slot>, path: String) {
         let mut window_frames = 0u32;
         let mut consecutive_errors = 0u32;
 
-        while slot.running.load(Ordering::Relaxed) {
+        while worker.is_running() {
             let (buf, meta) = match stream.next() {
                 Ok(x) => x,
                 Err(e) => {
@@ -277,7 +371,7 @@ fn capture_loop(dev: Device, fmt: Format, slot: Arc<Slot>, path: String) {
                     if consecutive_errors >= 3 {
                         // Tear the stream down and start over after a pause.
                         drop(stream);
-                        sleep_while_running(&slot, retry);
+                        sleep_while_running(&worker, retry);
                         continue 'outer;
                     }
                     std::thread::sleep(Duration::from_millis(100));
@@ -316,14 +410,14 @@ fn capture_loop(dev: Device, fmt: Format, slot: Arc<Slot>, path: String) {
         }
     }
     slot.fps.store(0, Ordering::Relaxed);
-    if slot.running.load(Ordering::Relaxed) {
+    if worker.is_running() {
         eprintln!("{path}: {}", slot.status());
     }
 }
 
-fn sleep_while_running(slot: &Slot, d: Duration) {
+pub fn sleep_while_running(worker: &Worker, d: Duration) {
     let end = Instant::now() + d;
-    while slot.running.load(Ordering::Relaxed) && Instant::now() < end {
+    while worker.is_running() && Instant::now() < end {
         std::thread::sleep(Duration::from_millis(50));
     }
 }

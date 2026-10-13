@@ -4,9 +4,12 @@
 //!        0 / G    back to the grid     R  force a full rescan
 //!
 //! Cameras are detected automatically: /dev is polled every second and tiles
-//! are added or removed as devices are plugged in or unplugged.
+//! are added or removed as devices are plugged in or unplugged. With the
+//! `kinect2` feature, Kinect v2 sensors (libfreenect2) are detected too.
 
 mod capture;
+#[cfg(feature = "kinect2")]
+mod kinect2;
 
 use std::time::{Duration, Instant};
 
