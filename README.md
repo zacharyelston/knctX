@@ -19,6 +19,19 @@ Keys: arrows / 1-6 / click to choose, Enter to open, `D` toggles demo mode (boot
 person instead of the Kinect), Esc goes back. In the Scan Library, `R` rebuilds the selected scan from
 its raw frames. `knctxplore --shot home out.png` renders a screen headlessly.
 
+## camgrid (all cameras at once)
+
+`camgrid/` is a separate Rust app that shows every camera on the machine in one window:
+V4L2 webcams, the Kinect v1's RGB camera, and (with `--features kinect2`) the Kinect v2's
+color and depth streams through libfreenect2. Cameras are detected as they are plugged in.
+
+```bash
+cd camgrid && cargo run --release --features kinect2
+```
+
+See `camgrid/README.md` for keys, the Kinect v2 setup (patched libfreenect2 PKGBUILD in
+`camgrid/contrib/`), and the USB bandwidth notes.
+
 ## Requirements
 
 - `libfreenect` with Python 3 bindings (Arch: AUR `libfreenect`)
