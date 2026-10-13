@@ -1,0 +1,17 @@
+[package]
+name = "camgrid"
+version = "0.1.0"
+edition = "2021"
+description = "Live grid view of every V4L2 camera attached to the machine"
+
+[dependencies]
+minifb = "0.29"
+v4l = "0.14"
+zune-jpeg = "0.5"
+zune-core = "0.5"
+fontdue = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
