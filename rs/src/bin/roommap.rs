@@ -9,9 +9,12 @@
 //! View:  W/S dolly, A/D strafe, R/F up/down, Home reset, 1/2 toggle v1/v2, M map on/off,
 //!        L live clouds on/off, X mirror, P point size
 //! v2 pose: arrows = move x/z, PgUp/PgDn = move y, Z/C yaw, T/G pitch, V/B roll
-//!        (hold Shift for fine steps), I = ICP refine, Y = flip v2 mirror, J = tint clouds
+//!        (hold Shift for fine steps), I = align on room planes, U = ICP refine, Y = flip v2 mirror, J = tint clouds
 //!        per sensor to judge alignment (or start with --tint), O = reset pose, K = save pose
+//!        3 = let the v2 win where both sensors see (default; --both to start off)
 //! Map:   N clear map, E export PLY to ../pointclouds/
+//! Args:  --tint, --both, --no-polish (skip the ICP after the plane alignment),
+//!        --baseline 27in (fix the camera separation), --dump DIR (write both clouds and exit)
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -170,13 +173,13 @@ fn kabsch(src: &[V3], dst: &[V3]) -> Pose {
 
 /// Point-to-point ICP: refine `init` so that init(src) lands on `tgt`.
 /// Returns the pose, final RMS residual (m) and the inlier fraction.
-fn icp(src: &[V3], src_col: &[[u8; 3]], tgt: &[V3], tgt_col: &[[u8; 3]], init: Pose, log: &mut dyn FnMut(String)) -> (Pose, f32, f32) {
+fn icp(src: &[V3], src_col: &[[u8; 3]], tgt: &[V3], tgt_col: &[[u8; 3]], init: Pose, fine_only: bool, log: &mut dyn FnMut(String)) -> (Pose, f32, f32) {
     let (src, src_l) = voxel_downsample(src, &luminance(src_col), 0.05);
     let (tgt, tgt_l) = voxel_downsample(tgt, &luminance(tgt_col), 0.04);
     let mut pose = init;
     let mut rms = f32::NAN;
     let mut frac = 0.0;
-    let schedule = [0.6, 0.4, 0.3, 0.2, 0.15, 0.1, 0.08, 0.06, 0.05];
+    let schedule: &[f32] = if fine_only { &[0.2, 0.15, 0.1, 0.08, 0.06, 0.05] } else { &[0.6, 0.4, 0.3, 0.2, 0.15, 0.1, 0.08, 0.06, 0.05] };
     for (round, &max_d) in schedule.iter().enumerate() {
         // cell = search radius, so a query touches at most 27 cells
         let grid = Grid::new(tgt.clone(), tgt_l.clone(), max_d);
@@ -204,6 +207,195 @@ fn icp(src: &[V3], src_col: &[[u8; 3]], tgt: &[V3], tgt_col: &[[u8; 3]], init: P
         }
     }
     (pose, rms, frac)
+}
+
+// ----------------------------------------------------------------------------- room-plane alignment
+
+/// Tiny deterministic xorshift RNG (no rand dependency needed).
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 { let mut x = self.0; x ^= x << 13; x ^= x >> 7; x ^= x << 17; self.0 = x; x }
+    fn below(&mut self, n: usize) -> usize { (self.next() % n as u64) as usize }
+}
+
+/// Rotation by `a` radians about the unit axis `u` (Rodrigues).
+fn axis_angle(u: V3, a: f32) -> M3 {
+    let (c, s) = (a.cos(), a.sin());
+    let t = 1.0 - c;
+    [
+        [c + u[0] * u[0] * t, u[0] * u[1] * t - u[2] * s, u[0] * u[2] * t + u[1] * s],
+        [u[1] * u[0] * t + u[2] * s, c + u[1] * u[1] * t, u[1] * u[2] * t - u[0] * s],
+        [u[2] * u[0] * t - u[1] * s, u[2] * u[1] * t + u[0] * s, c + u[2] * u[2] * t],
+    ]
+}
+
+fn transpose(m: &M3) -> M3 { [[m[0][0], m[1][0], m[2][0]], [m[0][1], m[1][1], m[2][1]], [m[0][2], m[1][2], m[2][2]]] }
+
+/// Plane n·p + d = 0 with |n| = 1.
+#[derive(Clone, Copy)]
+struct Plane { n: V3, d: f32, inliers: usize }
+
+/// Least-squares plane through `pts` (normal = smallest-variance direction, by power iteration on the inverse).
+fn fit_plane(pts: &[V3]) -> Option<Plane> {
+    if pts.len() < 3 { return None; }
+    let n = pts.len() as f32;
+    let c = scale(pts.iter().fold([0.0; 3], |a, p| add(a, *p)), 1.0 / n);
+    let mut cov = [[0.0f32; 3]; 3];
+    for p in pts { let q = sub(*p, c); for i in 0..3 { for j in 0..3 { cov[i][j] += q[i] * q[j]; } } }
+    // smallest eigenvector: power iteration on (tr(cov) I - cov)
+    let tr = cov[0][0] + cov[1][1] + cov[2][2];
+    let m: M3 = [[tr - cov[0][0], -cov[0][1], -cov[0][2]], [-cov[1][0], tr - cov[1][1], -cov[1][2]], [-cov[2][0], -cov[2][1], tr - cov[2][2]]];
+    let mut v = [0.3f32, 0.5, 0.8];
+    for _ in 0..100 { v = normalize(mat_vec(&m, v)); }
+    Some(Plane { n: v, d: -dot(v, c), inliers: pts.len() })
+}
+
+/// RANSAC plane whose normal is within `max_ang` (radians) of `axis` (either sign), refined by least squares.
+fn ransac_plane(pts: &[V3], axis: V3, max_ang: f32, tol: f32, iters: usize, rng: &mut Rng) -> Option<Plane> {
+    if pts.len() < 50 { return None; }
+    let min_cos = max_ang.cos();
+    // score candidates on a subsample so that many iterations stay cheap
+    let probe: Vec<V3> = if pts.len() > 2500 { (0..2500).map(|_| pts[rng.below(pts.len())]).collect() } else { pts.to_vec() };
+    let mut best: Option<(usize, V3, f32)> = None;
+    for _ in 0..iters {
+        let a = pts[rng.below(pts.len())];
+        // pick the other two near the first so that small planes get sampled too
+        let (mut b, mut c) = (a, a);
+        for _ in 0..40 { let q = pts[rng.below(pts.len())]; if norm(sub(q, a)) < 1.5 { if b == a { b = q; } else { c = q; break; } } }
+        let n = cross(sub(b, a), sub(c, a));
+        if norm(n) < 1e-6 { continue; }
+        let n = normalize(n);
+        if dot(n, axis).abs() < min_cos { continue; }
+        let d = -dot(n, a);
+        let k = probe.iter().filter(|p| (dot(n, **p) + d).abs() < tol).count();
+        if best.map_or(true, |b| k > b.0) { best = Some((k, n, d)); }
+    }
+    let (k, n, d) = best?;
+    if k * pts.len() / probe.len() < 50 { return None; }
+    // refit on the inliers until the inlier set stops growing
+    let mut pl = Plane { n, d, inliers: 0 };
+    for _ in 0..10 {
+        let inl: Vec<V3> = pts.iter().copied().filter(|p| (dot(pl.n, *p) + pl.d).abs() < tol).collect();
+        let mut nxt = fit_plane(&inl)?;
+        if dot(nxt.n, pl.n) < 0.0 { nxt.n = scale(nxt.n, -1.0); nxt.d = -nxt.d; }
+        nxt.inliers = pts.iter().filter(|p| (dot(nxt.n, **p) + nxt.d).abs() < tol).count();
+        if nxt.inliers <= pl.inliers { break; }
+        pl = nxt;
+    }
+    Some(pl)
+}
+
+/// A sensor's position/orientation relative to the room's horizontal plane (ceiling or floor)
+/// and its dominant vertical wall: `r` maps camera -> room axes (right, up, forward=toward wall),
+/// `c` is the camera position in that frame with lateral coordinate 0 (unknown).
+struct RoomFrame { r: M3, c: V3, ceiling: bool, info: String, up: V3, d_h: f32 }
+
+/// `tol` is the plane inlier tolerance: a few cm for the Kinect v2, more for the Kinect v1
+/// whose depth is quantised in 10-20 cm steps beyond 4 m.
+fn room_frame(pts: &[V3], tol: f32, rng: &mut Rng) -> Result<RoomFrame, String> {
+    // horizontal plane: normal within 25 deg of the camera's y axis
+    let h = ransac_plane(pts, [0.0, 1.0, 0.0], 25f32.to_radians(), tol * 0.6, 1500, rng).ok_or("no ceiling/floor plane")?;
+    // orient the normal upward (-y in this y-down frame); then d < 0 means the plane is above (ceiling)
+    let (mut n, mut d) = (h.n, h.d);
+    if n[1] > 0.0 { n = scale(n, -1.0); d = -d; }
+    let up = n;
+    let ceiling = d < 0.0;
+    let rest: Vec<V3> = pts.iter().copied().filter(|p| (dot(up, *p) + d).abs() > tol * 1.5).collect();
+    // vertical wall: normal perpendicular to `up` (within 8 deg), in front of the camera
+    let mut w = ransac_plane(&rest, up, (90f32 - 8.0).to_radians(), tol, 8000, rng).ok_or("no wall plane")?;
+    if w.d > 0.0 { w.n = scale(w.n, -1.0); w.d = -w.d; } // normal points away from the camera, toward the wall
+    let fwd = normalize(sub(w.n, scale(up, dot(w.n, up))));
+    let right = normalize(cross(fwd, up));
+    let r: M3 = [right, up, fwd];
+    let c = [0.0, d, w.d];
+    let info = format!(
+        "{} {:.2} m {}, wall {:.2} m ahead, yaw {:+.1} deg, pitch {:+.1} deg ({} / {} pts)",
+        if ceiling { "ceiling" } else { "floor" }, d.abs(), if ceiling { "above" } else { "below" },
+        -w.d, fwd[0].atan2(fwd[2]).to_degrees(), (-up[2]).asin().to_degrees(), h.inliers, w.inliers
+    );
+    Ok(RoomFrame { r, c, ceiling, info, up, d_h: d })
+}
+
+/// Align the v2 cloud to the v1 cloud through the room's planes: the ceiling (or floor) fixes
+/// pitch, roll and height, the dominant wall fixes yaw and distance, and the remaining lateral
+/// offset along the wall is found by scanning for the best colour-gated point overlap.
+/// Returns the pose and the implied distance between the two cameras.
+fn room_align(src: &[V3], src_col: &[[u8; 3]], tgt: &[V3], tgt_col: &[[u8; 3]], baseline: Option<f32>, log: &mut dyn FnMut(String)) -> Result<(Pose, f32), String> {
+    let mut rng = Rng(0x9E3779B97F4A7C15);
+    let (src, src_l) = voxel_downsample(src, &luminance(src_col), 0.04);
+    let (tgt, tgt_l) = voxel_downsample(tgt, &luminance(tgt_col), 0.04);
+    let f2 = room_frame(&src, 0.05, &mut rng).map_err(|e| format!("v2: {e}"))?;
+    let f1 = room_frame(&tgt, 0.12, &mut rng).map_err(|e| format!("v1: {e}"))?;
+    log(format!("v2: {}", f2.info));
+    log(format!("v1: {}", f1.info));
+    if f1.ceiling != f2.ceiling { return Err("sensors locked onto different horizontal planes (ceiling vs floor)".into()); }
+    // p1 = R1^T (R2 p2 + c2 - c1 + lateral)
+    let frame = |f1: &RoomFrame| {
+        let r1t = transpose(&f1.r);
+        (mat_mul(&r1t, &f2.r), mat_vec(&r1t, sub(f2.c, f1.c)), mat_vec(&r1t, [1.0, 0.0, 0.0]))
+    };
+    let (r, base, lateral) = frame(&f1);
+    // Scan over every v2 point except the ceiling/floor, which slides freely and would only add
+    // noise: the wall segment pins the heading, the picture and the furniture pin the lateral offset.
+    let on_h = |p: &V3| (dot(f2.up, *p) + f2.d_h).abs() < 0.08;
+    let feats: Vec<(V3, f32)> = src.iter().zip(&src_l).filter(|(p, _)| !on_h(p)).map(|(p, l)| (*p, *l)).collect();
+    if feats.len() < 50 { return Err(format!("too few distinctive v2 points for the lateral scan ({})", feats.len())); }
+    log(format!("heading/lateral scan over {} v2 points", feats.len()));
+    let grid = Grid::new(tgt.clone(), tgt_l.clone(), 0.06);
+    // The v1's wall normal is not trustworthy either (its depth bows), so the v2's heading is
+    // searched too: rotate the v2 about the vertical axis through its own position.
+    let up1 = f1.up;
+    let with_yaw = |dyaw: f32| mat_mul(&axis_angle(up1, dyaw), &r);
+    let score = |ry: &M3, dx: f32| -> usize {
+        let pose = Pose { r: *ry, t: add(base, scale(lateral, dx)) };
+        feats.iter().filter(|(p, l)| grid.nearest(pose.apply(*p), 0.06, Some((*l, 0.15))).is_some()).count()
+    };
+    let mut best = (0.0f32, f32::NAN, 0usize); // (yaw, lateral, matches)
+    let mut yaw = -16f32.to_radians();
+    while yaw <= 16.01f32.to_radians() {
+        let ry = with_yaw(yaw);
+        let mut dx = -1.5f32;
+        while dx <= 1.5 {
+            let k = score(&ry, dx);
+            if k > best.2 { best = (yaw, dx, k); }
+            dx += 0.04;
+        }
+        yaw += 2f32.to_radians();
+    }
+    if best.2 < 50 { return Err("no lateral overlap found".into()); }
+    // refine: 0.5 deg and 1 cm around the best
+    let coarse = best;
+    let mut yaw = coarse.0 - 2f32.to_radians();
+    while yaw <= coarse.0 + 2.01f32.to_radians() {
+        let ry = with_yaw(yaw);
+        let mut dx = coarse.1 - 0.04;
+        while dx <= coarse.1 + 0.04 {
+            let k = score(&ry, dx);
+            if k > best.2 { best = (yaw, dx, k); }
+            dx += 0.01;
+        }
+        yaw += 0.5f32.to_radians();
+    }
+    let pct = |k: usize| k as f32 * 100.0 / feats.len() as f32;
+    log(format!("heading {:+.1} deg off the wall-plane estimate, lateral {:+.2} m along the wall ({:.0}% of v2 points matched within 6 cm)", best.0.to_degrees(), best.1, pct(best.2)));
+    let r = with_yaw(best.0);
+    let score = |dx: f32| score(&r, dx);
+    let mut dx = best.1;
+    if let Some(b) = baseline {
+        // keep the planes, but pick the lateral offset that puts the cameras `b` apart
+        let bb = dot(base, lateral);
+        let disc = bb * bb - (dot(base, base) - b * b);
+        if disc < 0.0 {
+            log(format!("cannot place the cameras {b:.2} m apart with these planes (closest {:.2} m); using the colour scan", (dot(base, base) - bb * bb).max(0.0).sqrt()));
+        } else {
+            let (d1, d2) = (-bb - disc.sqrt(), -bb + disc.sqrt());
+            let (k1, k2) = (score(d1), score(d2));
+            dx = if k1 >= k2 { d1 } else { d2 };
+            log(format!("baseline {b:.2} m: lateral {:+.2} m ({:.0}% matched) chosen over {:+.2} m ({:.0}% matched)", dx, pct(k1.max(k2)), if k1 >= k2 { d2 } else { d1 }, pct(k1.min(k2))));
+        }
+    }
+    let pose = Pose { r, t: add(base, scale(lateral, dx)) };
+    Ok((pose, norm(pose.t)))
 }
 
 // ----------------------------------------------------------------------------- voxel map
@@ -421,10 +613,22 @@ struct App {
     v1_last: Option<(Vec<V3>, Vec<[u8; 3]>)>,
     v2_last: Option<(Vec<V3>, Vec<[u8; 3]>)>,
     icp_pending: bool,
-    /// Run ICP once automatically when both sensors are live (no saved pose).
+    align_pending: bool,
+    /// Run the room alignment once automatically when both sensors are live (no saved pose).
     auto_icp: Option<Instant>,
     /// Draw v1 points bluish and v2 points orange instead of their colours.
     tint: bool,
+    /// Known distance between the two cameras (m), from --baseline.
+    baseline: Option<f32>,
+    /// Follow the plane alignment with a short ICP (off with --no-polish).
+    polish: bool,
+    /// Where the Kinect v2 has a valid depth, drop the Kinect v1's points (the v1 is coarse
+    /// and bowed beyond ~4 m, so letting both in doubles every surface in the overlap).
+    v2_first: bool,
+    /// Kinect v2 depth image (512x424, metres, 0 = none) of the latest frame, for the overlap test.
+    v2_depth: Vec<f32>,
+    /// Which v1 points survive the overlap test (parallel to v1_last).
+    v1_keep: Vec<bool>,
 }
 
 impl App {
@@ -459,37 +663,88 @@ impl App {
 
     /// Pull new frames from both sensors and merge them into the map.
     fn ingest(&mut self) {
-        if self.v1.seq() != self.v1_seq {
-            if let Some((rgb, depth)) = self.v1.frames() {
-                self.v1_seq = self.v1.seq();
-                let (pts, col) = v1_cloud(&rgb, &depth, 2, self.v1_fx);
-                if self.show_v1 { for (p, c) in pts.iter().zip(&col) { self.map.insert(*p, *c); } }
-                self.v1_last = Some((pts, col));
-                self.v1_raw = Some((rgb, depth));
-            }
-        }
         if self.v2.seq.load(std::sync::atomic::Ordering::SeqCst) != self.v2_seq {
             if let Some(cloud) = self.v2.cloud() {
                 self.v2_seq = self.v2.seq.load(std::sync::atomic::Ordering::SeqCst);
                 let (pts, col) = v2_cloud(&cloud, 2, self.v2_mirror);
                 if self.show_v2 { for (p, c) in pts.iter().zip(&col) { self.map.insert(self.v2_pose.apply(*p), *c); } }
                 self.v2_last = Some((pts, col));
+                self.v2_depth = vec![0.0; kinect3d::kinect2::W * kinect3d::kinect2::H];
+                for (i, &pix) in cloud.pix.iter().enumerate() { self.v2_depth[pix as usize] = cloud.pts[i][2]; }
                 self.v2_raw = Some(cloud);
+            }
+        }
+        if self.v1.seq() != self.v1_seq {
+            if let Some((rgb, depth)) = self.v1.frames() {
+                self.v1_seq = self.v1.seq();
+                let (pts, col) = v1_cloud(&rgb, &depth, 2, self.v1_fx);
+                self.v1_keep = self.overlap_mask(&pts);
+                if self.show_v1 {
+                    for ((p, c), keep) in pts.iter().zip(&col).zip(&self.v1_keep) { if *keep { self.map.insert(*p, *c); } }
+                }
+                self.v1_last = Some((pts, col));
+                self.v1_raw = Some((rgb, depth));
             }
         }
     }
 
+    /// For each v1 point: true if it should be kept, false if it falls on a pixel where the
+    /// Kinect v2 has its own (better) depth measurement.
+    fn overlap_mask(&self, pts: &[V3]) -> Vec<bool> {
+        if !self.v2_first || self.v2_depth.is_empty() { return vec![true; pts.len()]; }
+        let [fx, fy, cx, cy] = *self.v2.intrinsics.lock().unwrap();
+        let (w, h) = (kinect3d::kinect2::W as i32, kinect3d::kinect2::H as i32);
+        let rt = transpose(&self.v2_pose.r);
+        let sx = if self.v2_mirror { -1.0 } else { 1.0 };
+        pts.iter().map(|p| {
+            let q = mat_vec(&rt, sub(*p, self.v2_pose.t)); // into the v2 camera frame
+            if q[2] < 0.3 { return true; }
+            let u = (sx * q[0] / q[2] * fx + cx - 0.5).round() as i32;
+            let v = (q[1] / q[2] * fy + cy - 0.5).round() as i32;
+            if u < 0 || v < 0 || u >= w || v >= h { return true; }
+            self.v2_depth[(v * w + u) as usize] <= 0.0
+        }).collect()
+    }
+
+    /// Plane-based alignment (ceiling/floor + wall + lateral colour scan).
+    fn run_room_align(&mut self) {
+        let (Some(v1), Some(v2)) = (self.v1_last.clone(), self.v2_last.clone()) else { self.say("align: need frames from both sensors".into()); return };
+        let mut lines = Vec::new();
+        let t0 = Instant::now();
+        let res = room_align(&v2.0, &v2.1, &v1.0, &v1.1, self.baseline, &mut |s| lines.push(s));
+        for l in lines { self.say(l); }
+        match res {
+            Ok((mut pose, _)) => {
+                if self.polish {
+                    // settle the details (picture, furniture) with a short colour-gated ICP
+                    let mut lines = Vec::new();
+                    let (p2, rms, frac) = icp(&v2.0, &v2.1, &v1.0, &v1.1, pose, true, &mut |s| lines.push(s));
+                    for l in lines { self.say(l); }
+                    if rms.is_finite() && rms < 0.12 && frac > 0.15 { pose = p2; } else { self.say("ICP polish rejected, keeping the plane alignment".into()); }
+                }
+                self.v2_pose = pose;
+                self.map.cells.clear();
+                let sep = norm(pose.t);
+                let yaw = pose.r[0][2].atan2(pose.r[2][2]).to_degrees();
+                self.say(format!("aligned in {:.1} s: cameras {:.2} m ({:.0} in) apart, v2 yawed {:+.1} deg; map cleared", t0.elapsed().as_secs_f32(), sep, sep / 0.0254, yaw));
+                self.save_pose();
+            }
+            Err(e) => self.say(format!("room alignment failed: {e}; press U for plain ICP or adjust by hand")),
+        }
+    }
+
+    /// Point-to-point ICP refinement from the current pose.
     fn run_icp(&mut self) {
         let (Some(v1), Some(v2)) = (&self.v1_last, &self.v2_last) else { self.say("ICP: need frames from both sensors".into()); return };
         let init = self.v2_pose;
         let mut lines = Vec::new();
         let t0 = Instant::now();
-        let (pose, rms, frac) = icp(&v2.0, &v2.1, &v1.0, &v1.1, init, &mut |s| lines.push(s));
+        let (pose, rms, frac) = icp(&v2.0, &v2.1, &v1.0, &v1.1, init, false, &mut |s| lines.push(s));
         for l in lines { self.say(l); }
         if rms.is_finite() && rms < 0.12 && frac > 0.15 {
             self.v2_pose = pose;
             self.map.cells.clear();
-            self.say(format!("ICP done in {:.1} s: rms {:.3} m, map cleared", t0.elapsed().as_secs_f32(), rms));
+            self.say(format!("ICP done in {:.1} s: rms {:.3} m, cameras {:.2} m apart, map cleared", t0.elapsed().as_secs_f32(), rms, norm(pose.t)));
             self.save_pose();
         } else {
             self.say("ICP rejected (too little overlap); adjust the pose by hand and retry".into());
@@ -531,12 +786,18 @@ impl App {
             match k {
                 Key::Key1 => { self.show_v1 = !self.show_v1; }
                 Key::Key2 => { self.show_v2 = !self.show_v2; }
+                Key::Key3 => {
+                    self.v2_first = !self.v2_first;
+                    self.map.cells.clear();
+                    self.say(format!("v2 takes priority in the overlap: {}; map cleared", if self.v2_first { "on" } else { "off (both sensors everywhere)" }));
+                }
                 Key::M => self.show_map = !self.show_map,
                 Key::L => self.show_live = !self.show_live,
                 Key::X => self.mirror = !self.mirror,
                 Key::P => self.point_size = if self.point_size >= 4 { 1 } else { self.point_size + 1 },
                 Key::H => self.help = !self.help,
-                Key::I => self.icp_pending = true,
+                Key::I => self.align_pending = true,
+                Key::U => self.icp_pending = true,
                 Key::J => { self.tint = !self.tint; }
                 Key::Y => {
                     self.v2_mirror = !self.v2_mirror;
@@ -564,6 +825,29 @@ impl App {
         }
     }
 
+    /// Write both live clouds (sensor frames, full resolution) as PLY for offline analysis.
+    fn dump(&mut self, dir: &str) {
+        let dir = std::path::Path::new(dir);
+        let _ = std::fs::create_dir_all(dir);
+        let write = |path: &std::path::Path, pts: &[V3], col: &[[u8; 3]]| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+            write!(f, "ply\nformat ascii 1.0\nelement vertex {}\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n", pts.len())?;
+            for (p, c) in pts.iter().zip(col) { writeln!(f, "{:.4} {:.4} {:.4} {} {} {}", p[0], p[1], p[2], c[0], c[1], c[2])?; }
+            Ok(())
+        };
+        let mut n = 0;
+        if let Some((rgb, depth)) = &self.v1_raw {
+            let (pts, col) = v1_cloud(rgb, depth, 1, self.v1_fx);
+            if write(&dir.join("dump-v1.ply"), &pts, &col).is_ok() { n += pts.len(); }
+        }
+        if let Some(c) = &self.v2_raw {
+            let (pts, col) = v2_cloud(c, 1, self.v2_mirror);
+            if write(&dir.join("dump-v2.ply"), &pts, &col).is_ok() { n += pts.len(); }
+        }
+        self.say(format!("dumped {n} points to {}", dir.display()));
+    }
+
     fn draw(&self, w: usize, h: usize) -> Canvas {
         let mut fr = Frame3D::new(&self.view, w, h);
         let mx = |p: V3| if self.mirror { [-p[0], p[1], p[2]] } else { p };
@@ -575,7 +859,7 @@ impl App {
                 let l = (0.299 * c[0] as f32 + 0.587 * c[1] as f32 + 0.114 * c[2] as f32) * 0.6 + 90.0;
                 [(l * hue[0]) as u8, (l * hue[1]) as u8, (l * hue[2]) as u8]
             };
-            if self.show_v1 { if let Some((pts, col)) = &self.v1_last { for (p, c) in pts.iter().zip(col) { fr.splat(mx(*p), if self.tint { tint(c, [0.45, 0.7, 1.0]) } else { *c }, self.point_size); } } }
+            if self.show_v1 { if let Some((pts, col)) = &self.v1_last { for (i, (p, c)) in pts.iter().zip(col).enumerate() { if self.v1_keep.get(i).copied().unwrap_or(true) { fr.splat(mx(*p), if self.tint { tint(c, [0.45, 0.7, 1.0]) } else { *c }, self.point_size); } } } }
             if self.show_v2 { if let Some((pts, col)) = &self.v2_last { for (p, c) in pts.iter().zip(col) { fr.splat(mx(self.v2_pose.apply(*p)), if self.tint { tint(c, [1.0, 0.65, 0.3]) } else { *c }, self.point_size); } } }
         }
         // floor guess: 97th percentile of map y (y is down)
@@ -598,13 +882,14 @@ impl App {
         let sc = 0.45;
         let v1_ok = self.v1.frames().is_some();
         let st = format!(
-            "v1 {}  |  {}{}  |  map {} voxels ({:.0} MB)  |  v2 pose t=({:.2},{:.2},{:.2})  |  {}{}{}{}",
+            "v1 {}  |  {}{}  |  map {} voxels ({:.0} MB)  |  v2 at ({:.2},{:.2},{:.2}) = {:.2} m from v1  |  {}{}{}{}{}",
             if v1_ok { "live" } else { "no frames" }, self.v2.status(), if self.v2_mirror { " (mirror)" } else { "" },
             self.map.cells.len(),
             self.map.cells.len() as f32 * 48.0 / 1e6,
-            self.v2_pose.t[0], self.v2_pose.t[1], self.v2_pose.t[2],
+            self.v2_pose.t[0], self.v2_pose.t[1], self.v2_pose.t[2], norm(self.v2_pose.t),
             if self.show_v1 { "[1]v1 " } else { "[1]-- " },
             if self.show_v2 { "[2]v2 " } else { "[2]-- " },
+            if self.v2_first { "[3]v2-first " } else { "[3]both " },
             if self.show_map { "[M]map " } else { "[M]live-only " },
             if self.tint { "[J]tint " } else { "" },
         );
@@ -620,9 +905,9 @@ impl App {
         if self.help {
             let lines = [
                 "Mouse drag: orbit   wheel: zoom   W/S/A/D/R/F: move view   Home: reset view",
-                "1 / 2: include v1 / v2      M: show map      L: show live clouds      X: mirror      P: point size",
+                "1 / 2: include v1 / v2    3: v2 wins where both see    M: show map    L: show live clouds    X: mirror    P: point size",
                 "v2 pose:  arrows = move x/z   PgUp/PgDn = move y   Z/C yaw   T/G pitch   V/B roll   (Shift = fine)",
-                "I: ICP refine v2 pose    Y: flip v2 mirror    J: tint clouds (v1 blue / v2 orange) to judge alignment    O: reset pose    K: save pose",
+                "I: align v2 on ceiling + wall planes    U: ICP refine    Y: flip v2 mirror    J: tint clouds (v1 blue / v2 orange) to judge alignment    O: reset pose    K: save pose",
                 "N: clear map      E: export PLY to ../pointclouds/      Esc/Q: quit",
             ];
             let hh = 20 * lines.len() as i32 + 20;
@@ -630,6 +915,21 @@ impl App {
             for (i, l) in lines.iter().enumerate() { c.text(l, 32, 50 + 20 * i as i32, sc, [235, 235, 235], false); }
         }
     }
+}
+
+/// "27in", "27\"", "686mm", "68.6cm" or plain metres.
+fn parse_length(s: &str) -> Option<f32> {
+    let s = s.trim().to_lowercase();
+    let (num, unit) = s.split_at(s.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(s.len()));
+    let v: f32 = num.parse().ok()?;
+    Some(match unit.trim() {
+        "" | "m" => v,
+        "in" | "\"" | "inch" | "inches" => v * 0.0254,
+        "mm" => v / 1000.0,
+        "cm" => v / 100.0,
+        "ft" | "'" => v * 0.3048,
+        _ => return None,
+    })
 }
 
 fn main() {
@@ -659,11 +959,27 @@ fn main() {
         v1_last: None,
         v2_last: None,
         icp_pending: false,
+        align_pending: false,
         auto_icp: Some(Instant::now()),
         tint: std::env::args().any(|a| a == "--tint"),
+        baseline: None,
+        polish: !std::env::args().any(|a| a == "--no-polish"),
+        v2_first: !std::env::args().any(|a| a == "--both"),
+        v2_depth: Vec::new(),
+        v1_keep: Vec::new(),
     };
     app.load_pose();
-    if app.auto_icp.is_some() { app.say("no saved pose: ICP will align the Kinect v2 automatically once both sensors are live".into()); }
+    let args: Vec<String> = std::env::args().collect();
+    let dump_dir = args.iter().position(|a| a == "--dump").and_then(|i| args.get(i + 1).cloned());
+    if let Some(b) = args.iter().position(|a| a == "--baseline").and_then(|i| args.get(i + 1)) {
+        app.baseline = parse_length(b);
+        match app.baseline {
+            Some(m) => app.say(format!("camera baseline fixed at {m:.3} m ({:.1} in)", m / 0.0254)),
+            None => app.say(format!("could not parse --baseline {b:?} (use e.g. 27in, 0.686 or 686mm)")),
+        }
+    }
+    let started = Instant::now();
+    if app.auto_icp.is_some() { app.say("no saved pose: the Kinect v2 will be aligned on the room planes once both sensors are live".into()); }
 
     let mut win = Window::new("Room Map", CW, CH, WindowOptions { resize: true, scale_mode: minifb::ScaleMode::Stretch, ..Default::default() }).expect("window");
     win.set_target_fps(30);
@@ -694,10 +1010,17 @@ fn main() {
             // wait until both sensors have delivered and the v1 has settled for a moment
             if app.v1_last.is_some() && app.v2_last.is_some() && t0.elapsed().as_secs_f32() > 3.0 {
                 app.auto_icp = None;
-                app.icp_pending = true;
+                app.align_pending = true;
             }
         }
+        if app.align_pending { app.align_pending = false; app.run_room_align(); }
         if app.icp_pending { app.icp_pending = false; app.run_icp(); }
+        if let Some(dir) = &dump_dir {
+            if app.v1_last.is_some() && app.v2_last.is_some() && started.elapsed().as_secs_f32() > 4.0 {
+                app.dump(dir);
+                break;
+            }
+        }
 
         let c = app.draw(w, h);
         win.update_with_buffer(&c.buf, w, h).expect("update");

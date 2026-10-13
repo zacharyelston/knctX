@@ -23,12 +23,24 @@ its raw frames. `knctxplore --shot home out.png` renders a screen headlessly.
 
 `rs/src/bin/roommap.rs` fuses the Kinect v1 (libfreenect, registered depth) and the Kinect v2
 (libfreenect2, registered XYZ+RGB) into one coloured voxel map (3 cm) and renders it with an
-orbit camera. The v2's pose relative to the v1 is found automatically with ICP on first start
-(both sensors must see some of the same scene) and saved to `rs/roommap_pose.json`; it can also
-be nudged by hand and refined again with `I`. libfreenect2 delivers mirror images, so the v2
-cloud is flipped to match the v1 (`Y` toggles this). `J` (or `--tint`) colours the clouds per
-sensor, blue v1 / orange v2, to judge the alignment. ICP matches brightness as well as
-position in its fine rounds so flat walls cannot slide. `E` exports the map as PLY to `pointclouds/`.
+orbit camera. On first start (or with `I`) the v2's pose relative to the v1 is found from the
+room itself: the ceiling (or floor) plane fixes pitch, roll and height, the dominant wall fixes
+the distance to it, and a scan over heading and lateral offset picks the pose where the most v2
+points land on v1 points of similar brightness; a short colour-gated ICP then settles the
+details. The pose is saved to `rs/roommap_pose.json`, can be nudged by hand, and `U` runs a
+plain ICP refinement from the current pose. `--baseline 27in` forces the camera separation if
+you know it (the planes still fix everything else).
+
+The Kinect v1's depth beyond ~4 m is quantised in 10-20 cm steps and bows by 20-30 cm along a
+long wall, so no rigid pose makes both sensors agree everywhere. By default the v2 therefore
+wins wherever it has a measurement: v1 points that project onto a valid v2 depth pixel are
+dropped, and the v1 only fills in what the v2 cannot see (beyond 4.5 m, outside its field of
+view, holes). `3` toggles this (`--both` starts with it off).
+
+libfreenect2 delivers mirror images, so the v2 cloud is flipped to match the v1 (`Y` toggles
+this). `J` (or `--tint`) colours the clouds per sensor, blue v1 / orange v2, to judge the
+alignment. `E` exports the map as PLY to `pointclouds/`; `--dump DIR` writes both raw clouds
+as PLY (sensor frames) and exits, for offline analysis.
 
 ```bash
 cd rs && cargo run --release --bin roommap     # press H for the key list
